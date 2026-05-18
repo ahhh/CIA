@@ -1,1 +1,102 @@
-# CIA
+# CIA — Claude Instrumentation & Analysis
+
+External, passive monitor for Claude Code sessions. Observes API call latency, thinking phases, tool call timing, and file I/O without modifying Claude.
+
+## What it captures
+
+| Signal | How |
+|---|---|
+| Anthropic API request + response timing | mitmproxy intercepts HTTPS |
+| Model thinking phase start/end | SSE stream parsing |
+| Text generation start | SSE stream parsing |
+| Tool call start/end/error | Claude Code PreToolUse/PostToolUse hooks |
+| Session end | Claude Code Stop hook |
+| File I/O in watched dirs | `fswatch` subprocess |
+
+## Output format
+
+All events are JSONL (one JSON object per line). SQLite is kept in sync as a queryable mirror.
+
+```jsonc
+{
+  "phase": "api_thinking_end",
+  "ts": 1716000000.123,
+  "id": "evt_a1b2c3d4e5f6g7h8",
+  "session_id": "abc-123",
+  "duration_ms": 4821.3,
+  "model": "claude-sonnet-4-6",
+  "tokens_input": 2048,
+  "tokens_output": 512
+}
+```
+
+See [docs/event-schema.md](docs/event-schema.md) for the full field reference.
+
+## Quick start
+
+```bash
+# Install
+git clone https://github.com/yourname/cia
+cd cia
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+
+# Start daemon
+cia start
+
+# Trust mitmproxy CA cert (first time only — follow printed instructions)
+cia trust-cert
+
+# Install Claude Code hooks into current project
+cia install-hooks
+
+# Run Claude with the proxy
+HTTPS_PROXY=http://127.0.0.1:8080 \
+NODE_EXTRA_CA_CERTS=~/.mitmproxy/mitmproxy-ca-cert.pem \
+claude
+
+# Watch events live
+cia tail
+
+# Export when done
+cia export --format jsonl > session.jsonl
+cia stop
+
+# Run again — events accumulate in the same DB across runs
+cia start
+```
+
+## CLI reference
+
+```
+cia start [--proxy-port 8080] [--hook-port 7171] [--db PATH] [--jsonl PATH]
+          [--watch-dir DIR] [--foreground]
+cia stop
+cia status
+cia export [--format jsonl|csv] [--session ID] [--since EPOCH] [-o FILE]
+cia tail [--interval 1.0]
+cia install-hooks [--global]
+cia uninstall-hooks [--global]
+cia trust-cert
+```
+
+## IPC — Unix socket
+
+The daemon exposes `~/.cia/cia.sock`. Any process can control it with newline-delimited JSON:
+
+```bash
+echo '{"cmd":"status"}' | nc -U ~/.cia/cia.sock
+echo '{"cmd":"export","format":"jsonl"}' | nc -U ~/.cia/cia.sock
+echo '{"cmd":"stop"}' | nc -U ~/.cia/cia.sock
+```
+
+See [docs/socket-api.md](docs/socket-api.md) for the full command reference.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest          # 54 tests, no network required
+```
+
+See [docs/development.md](docs/development.md).
