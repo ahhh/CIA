@@ -39,6 +39,22 @@ All events are JSONL (one JSON object per line). SQLite is kept in sync as a que
 
 See [docs/event-schema.md](docs/event-schema.md) for the full field reference.
 
+## Derived analytics — `cia report`
+
+`cia report` computes performance metrics from the recorded events:
+
+| Section | What it shows |
+|---|---|
+| Turn anatomy | Each turn's wall-clock split into API time, thinking, tool execution, permission waits, and everything else |
+| Tool profiles | Per-tool duration percentiles (p50/p90/p99), error rates, output sizes |
+| Human latency | Time spent waiting on permission prompts and user input vs Claude actually working |
+| Compaction cost | Context tokens reclaimed by each compaction |
+| Rework | Files edited repeatedly in a single turn (thrash signal) |
+
+`api_request_start` events also carry the request anatomy (system prompt size, message count, tool definition size, thinking budget) in `meta.request`.
+
+Note: proxy events carry no session ID, so turn anatomy attributes API events to turns by time window — exact for single-session captures, approximate when multiple proxied sessions run concurrently.
+
 ## Quick start
 
 ```bash
@@ -81,6 +97,7 @@ cia start [--proxy-port 8080] [--hook-port 7171] [--db PATH] [--jsonl PATH]
 cia stop
 cia status
 cia export [--format jsonl|csv] [--session ID] [--since EPOCH] [-o FILE]
+cia report [--session ID] [--since EPOCH] [--input FILE.jsonl] [--json]
 cia tail [--interval 1.0]
 cia install-hooks [--global]
 cia uninstall-hooks [--global]

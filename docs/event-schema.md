@@ -39,6 +39,21 @@ Every CIA event is a JSON object. The canonical transport is JSONL (newline-deli
 
 Non-streaming `/v1/messages` calls have no thinking/generation sub-phases; their events carry `meta.streaming: false`. The `ts` on their `api_request_start` is backdated to when the request left the client, matching the streaming behaviour.
 
+#### Request anatomy (`meta.request` on `api_request_start`)
+
+How the request body spends the context window:
+
+| Field | Description |
+|---|---|
+| `body_chars` | Total request body size in characters |
+| `system_chars` | System prompt size |
+| `message_count` | Number of messages in the conversation |
+| `tool_count` | Number of tool definitions offered |
+| `tools_chars` | Total size of tool definitions (JSON) |
+| `max_tokens` | Requested output cap |
+| `thinking_budget_tokens` | Extended-thinking budget, if enabled |
+| `stream` | Whether the request asked for SSE streaming |
+
 ### Tokenizer
 
 Claude Code counts tokens server-side via `POST /v1/messages/count_tokens`; CIA times the roundtrip.

@@ -328,6 +328,158 @@ def _phase_colour(phase: str) -> str:
 
 
 # ------------------------------------------------------------------ #
+# report                                                               #
+# ------------------------------------------------------------------ #
+
+@main.command()
+@click.option("--session", default=None, help="Filter by session_id")
+@click.option("--since",   default=None, type=float, help="Unix timestamp lower bound")
+@click.option("--input", "input_file", default=None, type=click.Path(exists=True),
+              help="Read events from a JSONL file instead of the daemon")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of tables")
+def report(session, since, input_file, as_json):
+    """Derived performance report: turns, tools, human latency, compactions, rework."""
+    from cia.analytics import full_report
+
+    events = _load_events(input_file, since)
+    if session:
+        # Keep session-less proxy events; turn anatomy matches them by time.
+        events = [e for e in events if e.session_id in (None, session)]
+    if not events:
+        console.print("[yellow]No events found.[/yellow]")
+        return
+
+    data = full_report(events)
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+
+    _render_turns(data["turns"])
+    _render_tools(data["tools"])
+    _render_human(data["human"])
+    _render_compactions(data["compactions"])
+    _render_rework(data["rework"])
+
+
+def _load_events(input_file, since):
+    from cia.schema import Event
+    if input_file:
+        lines = Path(input_file).read_text().splitlines()
+    else:
+        cmd = {"cmd": "export", "format": "jsonl"}
+        if since is not None:
+            cmd["since"] = since
+        lines = _require_ok(_send(cmd)).get("data", "").splitlines()
+    events = []
+    for line in lines:
+        try:
+            events.append(Event.from_dict(json.loads(line)))
+        except Exception:
+            continue
+    if since is not None:
+        events = [e for e in events if e.ts >= since]
+    events.sort(key=lambda e: e.ts)
+    return events
+
+
+def _fmt_s(ms) -> str:
+    return f"{ms/1000:.1f}" if ms is not None else "-"
+
+
+def _render_turns(turns: list) -> None:
+    t = Table(title="Turn anatomy — where the wall-clock went (seconds)",
+              show_header=True, header_style="bold cyan")
+    for col in ("start", "wall", "api", "think", "tools", "wait", "other",
+                "tok", "edits"):
+        t.add_column(col, justify="right" if col != "start" else "left")
+    t.add_column("prompt", no_wrap=True, overflow="ellipsis", max_width=28)
+    for turn in turns:
+        t.add_row(
+            time.strftime("%H:%M:%S", time.localtime(turn["start_ts"])),
+            _fmt_s(turn["wall_ms"]), _fmt_s(turn["api_ms"]),
+            _fmt_s(turn["thinking_ms"]),
+            f"{_fmt_s(turn['tool_ms'])} ({turn['tool_calls']})",
+            _fmt_s(turn["permission_wait_ms"]), _fmt_s(turn["other_ms"]),
+            str(turn["tokens_output"]), str(turn["edits"]),
+            turn["prompt"],
+        )
+    console.print(t)
+    console.print("[dim]wait = permission prompts; other = mostly user "
+                  "interaction outside permission prompts. Full detail: "
+                  "cia report --json[/dim]")
+
+
+def _render_tools(tools: list) -> None:
+    t = Table(title="Tool performance profiles",
+              show_header=True, header_style="bold cyan")
+    for col in ("tool", "calls", "err%", "p50 ms", "p90 ms", "p99 ms",
+                "max ms", "total s", "avg out"):
+        t.add_column(col, justify="right" if col != "tool" else "left")
+    for p in tools:
+        t.add_row(
+            p["tool"], str(p["calls"]),
+            f"{p['error_rate']*100:.0f}",
+            f"{p['p50_ms']:.0f}", f"{p['p90_ms']:.0f}", f"{p['p99_ms']:.0f}",
+            f"{p['max_ms']:.0f}", f"{p['total_ms']/1000:.1f}",
+            f"{p['avg_output_bytes']/1024:.1f}K" if p["avg_output_bytes"] else "-",
+        )
+    console.print(t)
+
+
+def _render_human(human: dict) -> None:
+    t = Table(title="Human latency — time waiting on the user",
+              show_header=True, header_style="bold cyan")
+    for col in ("kind", "count", "total s", "mean s", "p50 s", "max s"):
+        t.add_column(col, justify="right" if col != "kind" else "left")
+    labels = {"permission": "permission waits", "input": "input waits",
+              "think": "think time (turn gap)"}
+    for key, label in labels.items():
+        s = human["summary"][key]
+        t.add_row(
+            label, str(s["count"]),
+            f"{s['total_s']:.1f}" if s["count"] else "-",
+            f"{s['mean_s']:.1f}" if s["count"] else "-",
+            f"{s['p50_s']:.1f}" if s["count"] else "-",
+            f"{s['max_s']:.1f}" if s["count"] else "-",
+        )
+    console.print(t)
+
+
+def _render_compactions(compactions: list) -> None:
+    if not compactions:
+        return
+    t = Table(title="Compaction cost", show_header=True, header_style="bold cyan")
+    for col in ("time", "trigger", "ctx before", "ctx after", "reclaimed", "recovery s"):
+        t.add_column(col, justify="right" if "ctx" in col or col == "reclaimed" else "left")
+    for c in compactions:
+        t.add_row(
+            time.strftime("%H:%M:%S", time.localtime(c["ts"])),
+            c["trigger"] or "-",
+            str(c["context_before"] or "-"), str(c["context_after"] or "-"),
+            str(c["reclaimed_tokens"] or "-"),
+            f"{c['recovery_s']:.1f}" if c["recovery_s"] is not None else "-",
+        )
+    console.print(t)
+
+
+def _render_rework(files: list) -> None:
+    flagged_or_busy = [f for f in files if f["flagged"] or f["edits"] >= 2]
+    if not flagged_or_busy:
+        return
+    t = Table(title="Rework — files edited repeatedly",
+              show_header=True, header_style="bold cyan")
+    for col in ("file", "edits", "max/turn", "fs events", "thrash?"):
+        t.add_column(col, justify="right" if col != "file" else "left")
+    for f in flagged_or_busy:
+        t.add_row(
+            f["file"], str(f["edits"]), str(f["max_edits_one_turn"]),
+            str(f["file_changes"] or "-"),
+            "[red]YES[/red]" if f["flagged"] else "",
+        )
+    console.print(t)
+
+
+# ------------------------------------------------------------------ #
 # install-hooks / uninstall-hooks                                      #
 # ------------------------------------------------------------------ #
 

@@ -58,6 +58,33 @@ def _parse_json_body(message) -> dict:
         return {}
 
 
+def _request_anatomy(body: dict, body_chars: int) -> dict:
+    """Shape of a /v1/messages request: how the context window is spent."""
+    system = body.get("system")
+    if isinstance(system, str):
+        system_chars = len(system)
+    elif isinstance(system, list):
+        system_chars = sum(len(json.dumps(b, default=str)) for b in system)
+    else:
+        system_chars = 0
+    tools = body.get("tools") or []
+    try:
+        tools_chars = len(json.dumps(tools, default=str)) if tools else 0
+    except Exception:
+        tools_chars = 0
+    thinking = body.get("thinking") or {}
+    return {
+        "body_chars": body_chars,
+        "system_chars": system_chars,
+        "message_count": len(body.get("messages") or []),
+        "tool_count": len(tools),
+        "tools_chars": tools_chars,
+        "max_tokens": body.get("max_tokens"),
+        "thinking_budget_tokens": thinking.get("budget_tokens"),
+        "stream": bool(body.get("stream")),
+    }
+
+
 # ------------------------------------------------------------------ #
 # mitmproxy addon                                                      #
 # ------------------------------------------------------------------ #
@@ -75,11 +102,17 @@ class CIAAddon:
             return
         now = time.time()
         endpoint = _endpoint(flow)
+        body_chars = 0
+        try:
+            body_chars = len(flow.request.get_text(strict=False) or "")
+        except Exception:
+            pass
         body = _parse_json_body(flow.request)
         self._req_info[flow.id] = {
             "ts": now,
             "endpoint": endpoint,
             "model": body.get("model"),
+            "anatomy": _request_anatomy(body, body_chars) if endpoint == _MESSAGES_PATH else None,
         }
         _dlog(f"→ {flow.request.method} {flow.request.path}  (flow {flow.id[:8]})")
 
@@ -101,6 +134,7 @@ class CIAAddon:
             parser = SSEParser(flow.id, self._emit)
             info = self._req_info.get(flow.id, {})
             parser.set_request_start(info.get("ts", time.time()))
+            parser.set_request_info(info.get("anatomy") or {})
             self._parsers[flow.id] = parser
             # Attach a streaming transformer so we see chunks in real time
             flow.response.stream = _make_stream_transformer(parser)
@@ -158,15 +192,18 @@ class CIAAddon:
         elif endpoint == _MESSAGES_PATH:
             usage = body.get("usage") or {}
             model = body.get("model") or info.get("model")
+            meta = {"flow_id": flow.id, "streaming": False,
+                    "message_id": body.get("id", ""),
+                    "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+                    "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0}
+            if info.get("anatomy"):
+                meta["request"] = info["anatomy"]
             self._emit(Event(
                 phase=Phase.API_REQUEST_START,
                 ts=req_ts or now,
                 model=model,
                 tokens_input=usage.get("input_tokens"),
-                meta={"flow_id": flow.id, "streaming": False,
-                      "message_id": body.get("id", ""),
-                      "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
-                      "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0},
+                meta=meta,
             ))
             self._emit(Event(
                 phase=Phase.API_RESPONSE_END,

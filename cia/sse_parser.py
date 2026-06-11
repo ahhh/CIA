@@ -57,6 +57,7 @@ class SSEParser:
         self._blocks: list[dict] = []
 
         self._model: Optional[str] = None
+        self._request_anatomy: dict = {}
         self._tokens_input: int = 0
         self._tokens_output: int = 0
         self._cache_read: int = 0
@@ -66,6 +67,10 @@ class SSEParser:
 
     def set_request_start(self, ts: float) -> None:
         self._request_start_ts = ts
+
+    def set_request_info(self, anatomy: dict) -> None:
+        """Attach request-body anatomy; included in api_request_start meta."""
+        self._request_anatomy = anatomy
 
     # ------------------------------------------------------------------ #
     # Ingestion                                                            #
@@ -145,19 +150,22 @@ class SSEParser:
         self._tokens_output = usage.get("output_tokens", self._tokens_output) or self._tokens_output
 
         ttfb_ms = self._ms_since_start(now)
+        meta = {
+            "flow_id": self._flow_id,
+            "message_id": msg.get("id", ""),
+            "ttfb_ms": ttfb_ms,
+            "cache_read_input_tokens": self._cache_read,
+            "cache_creation_input_tokens": self._cache_creation,
+        }
+        if self._request_anatomy:
+            meta["request"] = self._request_anatomy
         self._emit(Event(
             phase=Phase.API_REQUEST_START,
             ts=self._request_start_ts or now,
             session_id=self._session_id,
             model=self._model,
             tokens_input=self._tokens_input,
-            meta={
-                "flow_id": self._flow_id,
-                "message_id": msg.get("id", ""),
-                "ttfb_ms": ttfb_ms,
-                "cache_read_input_tokens": self._cache_read,
-                "cache_creation_input_tokens": self._cache_creation,
-            },
+            meta=meta,
         ))
 
     def _on_block_start(self, data: dict, now: float) -> None:
