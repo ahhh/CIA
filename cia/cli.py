@@ -386,13 +386,29 @@ def _event_extra(evt: dict) -> str:
         parts.append(f"ttft={lat['ttft_ms']:.0f}ms")
     if lat.get("thinking_ms") is not None:
         parts.append(f"think={lat['thinking_ms']:.0f}ms")
-    if phase == "api_thinking_end" and meta.get("est_thinking_tokens"):
-        parts.append(f"~{meta['est_thinking_tokens']}tok")
+    if phase == "api_thinking_end":
+        if meta.get("est_thinking_tokens"):
+            parts.append(f"~{meta['est_thinking_tokens']}tok")
+        if meta.get("interrupted"):
+            parts.append("CUT")
+        elif meta.get("signed") is False:
+            parts.append("unsigned")
+    if phase == "api_generation_start" and meta.get("thinking_to_tool_ms") is not None:
+        parts.append(f"dec={meta['thinking_to_tool_ms']:.0f}ms")
     think = meta.get("thinking") or {}
-    if think.get("est_thinking_tokens"):
-        frac = think.get("thinking_output_frac")
-        suffix = f" ({frac:.0%} of out)" if isinstance(frac, (int, float)) else ""
-        parts.append(f"think~{think['est_thinking_tokens']}tok{suffix}")
+    if think:
+        if think.get("est_thinking_tokens"):
+            frac = think.get("thinking_output_frac")
+            suffix = f" ({frac:.0%} of out)" if isinstance(frac, (int, float)) else ""
+            parts.append(f"think~{think['est_thinking_tokens']}tok{suffix}")
+        if think.get("interrupted"):
+            parts.append("THINK-CUT")
+        if think.get("thinking_requested") and not think.get("thinking_fired"):
+            parts.append("no-think")
+        if think.get("budget_utilization") is not None:
+            parts.append(f"budget={think['budget_utilization']:.0%}")
+        elif think.get("requested_effort"):
+            parts.append(f"effort={think['requested_effort']}")
     if lat.get("output_tokens_per_sec") is not None:
         parts.append(f"{lat['output_tokens_per_sec']:.0f}tok/s")
     if meta.get("cache_read_input_tokens"):

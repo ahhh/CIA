@@ -20,6 +20,7 @@ Timing vocabulary (all measured from when the request left, i.e. set_request_sta
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Callable, Optional
 
@@ -38,11 +39,29 @@ class SSEParser:
         emit: Callable[[Event], None],
         session_id: Optional[str] = None,
         progress_interval_s: float = 5.0,
+        capture_thinking: Optional[bool] = None,
+        thinking_sample_chars: Optional[int] = None,
     ) -> None:
         self._flow_id = flow_id
         self._emit = emit
         self._session_id = session_id
         self.progress_interval_s = progress_interval_s
+
+        # Opt-in capture of (truncated) thinking text. Off by default — the
+        # reasoning trace can contain sensitive context and is large. Enable
+        # with CIA_CAPTURE_THINKING=1; bound the stored sample with
+        # CIA_THINKING_SAMPLE_CHARS (default 2000).
+        if capture_thinking is None:
+            capture_thinking = os.environ.get(
+                "CIA_CAPTURE_THINKING", "").lower() in ("1", "true", "yes", "on")
+        if thinking_sample_chars is None:
+            try:
+                thinking_sample_chars = int(
+                    os.environ.get("CIA_THINKING_SAMPLE_CHARS", "2000"))
+            except ValueError:
+                thinking_sample_chars = 2000
+        self._capture_thinking = capture_thinking
+        self._thinking_sample_chars = max(0, thinking_sample_chars)
 
         self._buf = b""
 
@@ -57,8 +76,15 @@ class SSEParser:
         self._block_open: dict[int, tuple[str, float]] = {}
         # Per-block streamed character count (index → chars), for token estimates
         self._block_chars: dict[int, int] = {}
+        # Per-thinking-block: signature seen (signed = reasoning completed) and
+        # accumulated text (only when capture_thinking is on).
+        self._block_signed: dict[int, bool] = {}
+        self._block_text: dict[int, str] = {}
         # Completed blocks: list of {"type", "duration_ms"}
         self._blocks: list[dict] = []
+        # Timestamp of the most recent thinking-block close, consumed by the
+        # next tool_use block to measure thinking→tool ("decisiveness") latency.
+        self._last_thinking_end_ts: Optional[float] = None
 
         self._model: Optional[str] = None
         self._request_anatomy: dict = {}
@@ -69,6 +95,7 @@ class SSEParser:
         self._thinking_ms: float = 0.0
         self._thinking_chars: int = 0       # chars streamed inside thinking blocks
         self._thinking_blocks: int = 0      # count of thinking blocks
+        self._thinking_interrupted: bool = False  # a thinking block was cut off
         self._stop_reason: Optional[str] = None
 
         # In-flight progress (the data behind Claude Code's spinner line)
@@ -196,15 +223,23 @@ class SSEParser:
                       "since_request_ms": self._ms_since_start(now)},
             ))
         elif btype in ("text", "tool_use"):
+            meta = {"flow_id": self._flow_id, "block_index": idx,
+                    "block_type": btype,
+                    "tool": block.get("name") if btype == "tool_use" else None,
+                    "since_request_ms": self._ms_since_start(now)}
+            # Decisiveness: gap between the model finishing its reasoning and
+            # the tool call it chose. Consumed once, by the first tool_use
+            # block after a thinking block.
+            if btype == "tool_use" and self._last_thinking_end_ts is not None:
+                meta["thinking_to_tool_ms"] = round(
+                    (now - self._last_thinking_end_ts) * 1000, 1)
+                self._last_thinking_end_ts = None
             self._emit(Event(
                 phase=Phase.API_GENERATION_START,
                 ts=now,
                 session_id=self._session_id,
                 model=self._model,
-                meta={"flow_id": self._flow_id, "block_index": idx,
-                      "block_type": btype,
-                      "tool": block.get("name") if btype == "tool_use" else None,
-                      "since_request_ms": self._ms_since_start(now)},
+                meta=meta,
             ))
 
     def _on_block_delta(self, data: dict, now: float) -> None:
@@ -239,10 +274,18 @@ class SSEParser:
             self._out_chars += n
             self._block_chars[idx] = self._block_chars.get(idx, 0) + n
         elif dtype == "thinking_delta":
-            n = len(delta.get("thinking") or "")
+            text = delta.get("thinking") or ""
+            n = len(text)
             self._out_chars += n
             self._thinking_chars += n
             self._block_chars[idx] = self._block_chars.get(idx, 0) + n
+            if self._capture_thinking and self._thinking_sample_chars:
+                self._accumulate_thinking_text(idx, text)
+        elif dtype == "signature_delta":
+            # Anthropic finalises a thinking block with a cryptographic
+            # signature; its presence means the reasoning block completed.
+            if delta.get("signature"):
+                self._block_signed[idx] = True
 
     def _on_block_stop(self, data: dict, now: float) -> None:
         idx = data.get("index", 0)
@@ -253,30 +296,10 @@ class SSEParser:
         duration_ms = (now - start_ts) * 1000
         self._blocks.append({"type": btype, "index": idx, "duration_ms": duration_ms})
 
-        block_chars = self._block_chars.pop(idx, 0)
-
         if btype == "thinking":
-            self._thinking_ms += duration_ms
-            self._thinking_blocks += 1
-            # ~4 chars/token, matching the spinner estimate elsewhere.
-            est_tokens = block_chars // 4 if block_chars else None
-            think_tok_per_sec = (
-                round(est_tokens / (duration_ms / 1000), 1)
-                if est_tokens and duration_ms > 0 else None
-            )
-            self._emit(Event(
-                phase=Phase.API_THINKING_END,
-                ts=now,
-                session_id=self._session_id,
-                model=self._model,
-                duration_ms=duration_ms,
-                thinking_tokens=est_tokens,
-                meta={"flow_id": self._flow_id, "block_index": idx,
-                      "thinking_chars": block_chars,
-                      "est_thinking_tokens": est_tokens,
-                      "thinking_tokens_per_sec": think_tok_per_sec},
-            ))
+            self._emit_thinking_end(idx, duration_ms, now, interrupted=False)
         elif btype in ("text", "tool_use"):
+            self._block_chars.pop(idx, None)
             self._emit(Event(
                 phase=Phase.API_GENERATION_END,
                 ts=now,
@@ -286,6 +309,61 @@ class SSEParser:
                 meta={"flow_id": self._flow_id, "block_index": idx,
                       "block_type": btype},
             ))
+
+    def _accumulate_thinking_text(self, idx: int, text: str) -> None:
+        """Append thinking text for a block, capped at the sample budget
+        (head of the reasoning — the most useful part for 'why did it start
+        down this path'). Only called when capture_thinking is enabled."""
+        have = self._block_text.get(idx, "")
+        room = self._thinking_sample_chars - len(have)
+        if room > 0:
+            self._block_text[idx] = have + text[:room]
+
+    def _emit_thinking_end(
+        self, idx: int, duration_ms: float, now: float, interrupted: bool
+    ) -> None:
+        """Emit an api_thinking_end event for one thinking block, including the
+        token estimate, signature/interruption flags, and (opt-in) text sample."""
+        block_chars = self._block_chars.pop(idx, 0)
+        signed = self._block_signed.pop(idx, False)
+        sample = self._block_text.pop(idx, None)
+
+        self._thinking_ms += duration_ms
+        self._thinking_blocks += 1
+        self._last_thinking_end_ts = now
+        if interrupted:
+            self._thinking_interrupted = True
+
+        # ~4 chars/token, matching the spinner estimate elsewhere.
+        est_tokens = block_chars // 4 if block_chars else None
+        think_tok_per_sec = (
+            round(est_tokens / (duration_ms / 1000), 1)
+            if est_tokens and duration_ms > 0 else None
+        )
+        meta = {
+            "flow_id": self._flow_id,
+            "block_index": idx,
+            "thinking_chars": block_chars,
+            "est_thinking_tokens": est_tokens,
+            "thinking_tokens_per_sec": think_tok_per_sec,
+            # signed = block carried a completion signature; interrupted =
+            # the stream ended (typically max_tokens) before the block closed.
+            "signed": signed,
+            "interrupted": interrupted,
+        }
+        if sample is not None:
+            meta["thinking_sample"] = sample
+            meta["thinking_sample_truncated"] = block_chars > len(sample)
+        self._emit(Event(
+            phase=Phase.API_THINKING_END,
+            ts=now,
+            session_id=self._session_id,
+            model=self._model,
+            duration_ms=duration_ms,
+            thinking_tokens=est_tokens,
+            error="thinking_interrupted" if interrupted else None,
+            meta=meta,
+        ))
 
     def _maybe_emit_progress(self, now: float) -> None:
         """Emit an api_progress snapshot at most once per interval while the
@@ -325,6 +403,19 @@ class SSEParser:
 
     def _on_message_stop(self, now: float) -> None:
         self._stopped = True
+
+        # Close any thinking block left open when the stream ended — this is an
+        # interruption (almost always stop_reason == "max_tokens" cutting off
+        # reasoning before the block could finalise and sign).
+        for idx, (btype, start_ts) in list(self._block_open.items()):
+            if btype == "thinking":
+                self._block_open.pop(idx, None)
+                self._blocks.append(
+                    {"type": btype, "index": idx,
+                     "duration_ms": (now - start_ts) * 1000, "interrupted": True})
+                self._emit_thinking_end(
+                    idx, (now - start_ts) * 1000, now, interrupted=True)
+
         total_ms = self._ms_since_start(now)
         ttfb_ms = (
             (self._message_start_ts - self._request_start_ts) * 1000
@@ -362,11 +453,29 @@ class SSEParser:
         # Thinking summary: depth (est. tokens/chars), block count, and how
         # much of the turn's wall-clock and output budget went to reasoning.
         est_thinking_tokens = self._thinking_chars // 4 if self._thinking_chars else None
+        # Adaptive-thinking decision: what the request asked for vs. what fired.
+        anatomy = self._request_anatomy or {}
+        requested_budget = anatomy.get("thinking_budget_tokens")
+        thinking_type = anatomy.get("thinking_type")
+        # "Requested" = the model was allowed to think (adaptive/enabled, or a
+        # budget was set). thinking_fired = it actually did.
+        thinking_requested = bool(
+            requested_budget or (thinking_type and thinking_type != "disabled"))
         thinking = {
             "blocks": self._thinking_blocks,
             "thinking_ms": round(self._thinking_ms, 1) if self._thinking_ms else None,
             "est_thinking_tokens": est_thinking_tokens,
             "thinking_chars": self._thinking_chars or None,
+            "interrupted": self._thinking_interrupted,
+            "thinking_requested": thinking_requested,
+            "thinking_fired": self._thinking_blocks > 0,
+            "requested_effort": anatomy.get("effort"),
+            "requested_thinking_type": thinking_type,
+            "requested_budget_tokens": requested_budget,
+            "budget_utilization": (
+                round(est_thinking_tokens / requested_budget, 3)
+                if est_thinking_tokens and requested_budget else None
+            ),
             "thinking_time_frac": (
                 round(self._thinking_ms / total_ms, 3)
                 if self._thinking_ms and total_ms else None

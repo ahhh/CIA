@@ -73,6 +73,10 @@ def _request_anatomy(body: dict, body_chars: int) -> dict:
     except Exception:
         tools_chars = 0
     thinking = body.get("thinking") or {}
+    # effort lives under output_config (newer adaptive-thinking models); fall
+    # back to a top-level effort if a caller sets it there.
+    output_config = body.get("output_config") or {}
+    effort = output_config.get("effort", body.get("effort"))
     return {
         "body_chars": body_chars,
         "system_chars": system_chars,
@@ -80,7 +84,9 @@ def _request_anatomy(body: dict, body_chars: int) -> dict:
         "tool_count": len(tools),
         "tools_chars": tools_chars,
         "max_tokens": body.get("max_tokens"),
+        "thinking_type": thinking.get("type"),
         "thinking_budget_tokens": thinking.get("budget_tokens"),
+        "effort": effort,
         "stream": bool(body.get("stream")),
     }
 

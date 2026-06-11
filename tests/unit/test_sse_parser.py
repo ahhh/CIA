@@ -283,3 +283,133 @@ class TestThinkingTokens:
         assert think["est_thinking_tokens"] == 200    # 800 // 4
         assert think["thinking_output_frac"] == 1.0   # 200 est / 200 output
         assert end.thinking_tokens == 200
+
+
+def _sig_delta(idx, signature="sig_abc"):
+    return {
+        "_event": "content_block_delta",
+        "type": "content_block_delta",
+        "index": idx,
+        "delta": {"type": "signature_delta", "signature": signature},
+    }
+
+
+def _message_delta_stop(stop_reason="end_turn", output_tokens=50):
+    return {
+        "_event": "message_delta",
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason},
+        "usage": {"output_tokens": output_tokens},
+    }
+
+
+def _think_delta(idx, text):
+    return {
+        "_event": "content_block_delta",
+        "type": "content_block_delta",
+        "index": idx,
+        "delta": {"type": "thinking_delta", "thinking": text},
+    }
+
+
+class TestThinkingSignatureAndInterruption:
+    def test_completed_block_is_signed(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(_think_delta(0, "x" * 40), _sig_delta(0), _block_stop(0)))
+        end = next(e for e in events if e.phase is Phase.API_THINKING_END)
+        assert end.meta["signed"] is True
+        assert end.meta["interrupted"] is False
+
+    def test_interrupted_thinking_block_on_max_tokens(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        # thinking block opens and streams but never gets a content_block_stop;
+        # the stream ends with stop_reason max_tokens.
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(_think_delta(0, "x" * 40)))
+        p.feed(_sse(_message_delta_stop("max_tokens"), _message_stop()))
+
+        end = next(e for e in events if e.phase is Phase.API_THINKING_END)
+        assert end.meta["interrupted"] is True
+        assert end.meta["signed"] is False
+        assert end.error == "thinking_interrupted"
+
+        resp = next(e for e in events if e.phase is Phase.API_RESPONSE_END)
+        assert resp.meta["thinking"]["interrupted"] is True
+        assert resp.meta["stop_reason"] == "max_tokens"
+
+
+class TestAdaptiveThinkingCorrelation:
+    def test_budget_and_effort_surfaced(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.set_request_info({"thinking_type": "adaptive",
+                            "thinking_budget_tokens": 1000, "effort": "high"})
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(_think_delta(0, "z" * 800), _block_stop(0)))
+        p.feed(_sse(_message_delta_stop(output_tokens=300), _message_stop()))
+
+        t = next(e for e in events if e.phase is Phase.API_RESPONSE_END).meta["thinking"]
+        assert t["thinking_requested"] is True
+        assert t["thinking_fired"] is True
+        assert t["requested_effort"] == "high"
+        assert t["requested_budget_tokens"] == 1000
+        assert t["budget_utilization"] == 0.2          # 200 est / 1000
+
+    def test_thinking_requested_but_did_not_fire(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.set_request_info({"thinking_type": "adaptive"})
+        p.feed(_sse(_message_start(), _block_start(0, "text")))
+        p.feed(_sse(_block_stop(0), _message_delta_stop(), _message_stop()))
+
+        t = next(e for e in events if e.phase is Phase.API_RESPONSE_END).meta["thinking"]
+        assert t["thinking_requested"] is True
+        assert t["thinking_fired"] is False
+
+
+class TestThinkingToToolLatency:
+    def test_tool_use_after_thinking_has_decisiveness(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(_think_delta(0, "x" * 20), _block_stop(0)))
+        p.feed(_sse(_block_start(1, "tool_use")))
+
+        gen = next(e for e in events
+                   if e.phase is Phase.API_GENERATION_START
+                   and e.meta.get("block_type") == "tool_use")
+        assert "thinking_to_tool_ms" in gen.meta
+        assert gen.meta["thinking_to_tool_ms"] >= 0
+
+    def test_text_block_has_no_decisiveness(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(_block_stop(0), _block_start(1, "text")))
+        gen = next(e for e in events
+                   if e.phase is Phase.API_GENERATION_START)
+        assert "thinking_to_tool_ms" not in gen.meta
+
+
+class TestThinkingCapture:
+    def test_capture_off_by_default(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(_think_delta(0, "secret reasoning"), _block_stop(0)))
+        end = next(e for e in events if e.phase is Phase.API_THINKING_END)
+        assert "thinking_sample" not in end.meta
+
+    def test_capture_truncates_to_budget(self):
+        events: list[Event] = []
+        p = SSEParser("flow", events.append,
+                      capture_thinking=True, thinking_sample_chars=10)
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(_think_delta(0, "abcdefghijklmnop"), _block_stop(0)))
+        end = next(e for e in events if e.phase is Phase.API_THINKING_END)
+        assert end.meta["thinking_sample"] == "abcdefghij"   # capped at 10
+        assert end.meta["thinking_sample_truncated"] is True

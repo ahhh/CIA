@@ -55,7 +55,17 @@ See [docs/event-schema.md](docs/event-schema.md) for the full field reference.
 | Compaction cost | Context tokens reclaimed by each compaction |
 | Rework | Files edited repeatedly in a single turn (thrash signal) |
 
-`api_request_start` events also carry the request anatomy (system prompt size, message count, tool definition size, thinking budget) in `meta.request`.
+`api_request_start` events also carry the request anatomy (system prompt size, message count, tool definition size, thinking type/budget, effort) in `meta.request`.
+
+### Thinking instrumentation
+
+Each `api_thinking_end` records estimated thinking tokens, whether the block was **signed** (reasoning finished cleanly) or **interrupted** (cut off, usually by `max_tokens`), and the thinking→tool gap ("decisiveness") on the following tool call. Each `api_response_end` adds a `meta.thinking` summary correlating what the request asked for (`effort` / thinking type / budget) against what actually fired — including `thinking_requested` vs `thinking_fired` (the adaptive-thinking decision) and `budget_utilization`. See [docs/event-schema.md](docs/event-schema.md#thinking-instrumentation).
+
+To also persist a **truncated sample of the reasoning text** (off by default — it can be large and sensitive), start the daemon with `CIA_CAPTURE_THINKING=1` (bound the sample with `CIA_THINKING_SAMPLE_CHARS`, default 2000):
+
+```bash
+CIA_CAPTURE_THINKING=1 cia start
+```
 
 Note: proxy events carry no session ID, so turn anatomy attributes API events to turns by time window — exact for single-session captures, approximate when multiple proxied sessions run concurrently.
 

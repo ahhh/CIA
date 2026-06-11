@@ -17,7 +17,7 @@ Every CIA event is a JSON object. The canonical transport is JSONL (newline-deli
 | `model` | string\|null | no | Anthropic model ID (API events only) |
 | `tokens_input` | int\|null | no | Input token count |
 | `tokens_output` | int\|null | no | Output token count |
-| `thinking_tokens` | int\|null | no | Thinking token count (reserved for future use) |
+| `thinking_tokens` | int\|null | no | Estimated thinking tokens (~chars/4), set on `api_thinking_end` (per block) and `api_response_end` (whole turn) |
 | `error` | string\|null | no | Error message if applicable |
 | `meta` | object | yes | Extensible bag of additional data |
 
@@ -29,14 +29,40 @@ Every CIA event is a JSON object. The canonical transport is JSONL (newline-deli
 |---|---|---|
 | `api_request_start` | mitmproxy sees the POST to api.anthropic.com (via `message_start` SSE, or the HTTP roundtrip for non-streaming calls) | `model`, `tokens_input` |
 | `api_thinking_start` | First thinking SSE block opens | `model` |
-| `api_thinking_end` | Thinking SSE block closes | `model`, `duration_ms` |
-| `api_generation_start` | First text SSE block opens | `model` |
+| `api_thinking_end` | Thinking SSE block closes (or is cut off at stream end) | `model`, `duration_ms`, `thinking_tokens` |
+| `api_generation_start` | A text or tool_use SSE block opens | `model` |
 | `api_response_end` | `message_stop` SSE event received, or non-streaming response body received | `model`, `tokens_input`, `tokens_output`, `duration_ms` |
 | `api_request_error` | HTTP error response (4xx/5xx) | `error` |
 | `api_progress` | Every ~5s while a stream is in flight — the spinner's data | `model`, `duration_ms` (elapsed), `meta.state` (thinking/responding/waiting), `meta.est_output_tokens` |
 
 `duration_ms` on `api_thinking_end` = wall-clock time from thinking block start to stop.  
 `duration_ms` on `api_response_end` = wall-clock time from HTTP request sent to `message_stop` received (streaming) or full response received (non-streaming).
+
+#### Thinking instrumentation
+
+`api_thinking_end` carries, in `meta`:
+
+| Field | Description |
+|---|---|
+| `thinking_chars` / `est_thinking_tokens` | Streamed reasoning size (tokens ≈ chars/4) |
+| `thinking_tokens_per_sec` | Reasoning throughput for the block |
+| `signed` | Block carried a completion signature (`signature_delta`) — i.e. reasoning finished cleanly |
+| `interrupted` | Block never closed before stream end (usually `stop_reason: max_tokens`); also sets the top-level `error` to `thinking_interrupted` |
+| `thinking_sample` / `thinking_sample_truncated` | Truncated reasoning text — **only present when `CIA_CAPTURE_THINKING=1`** (off by default; bound with `CIA_THINKING_SAMPLE_CHARS`, default 2000) |
+
+`api_generation_start` for a `tool_use` block that immediately follows reasoning carries `meta.thinking_to_tool_ms` — the thinking→tool ("decisiveness") gap.
+
+`api_response_end` carries a `meta.thinking` summary for the whole turn:
+
+| Field | Description |
+|---|---|
+| `blocks` | Number of thinking blocks |
+| `thinking_ms` / `est_thinking_tokens` / `thinking_chars` | Totals across the turn |
+| `interrupted` | Any thinking block was cut off |
+| `thinking_requested` / `thinking_fired` | Whether thinking was allowed by the request vs. whether the model actually thought (the adaptive-thinking decision) |
+| `requested_effort` / `requested_thinking_type` / `requested_budget_tokens` | What the request asked for (from `meta.request`) |
+| `budget_utilization` | `est_thinking_tokens / requested_budget_tokens`, when a budget was set |
+| `thinking_time_frac` / `thinking_output_frac` | Reasoning's share of wall-clock and of output tokens |
 
 Non-streaming `/v1/messages` calls have no thinking/generation sub-phases; their events carry `meta.streaming: false`. The `ts` on their `api_request_start` is backdated to when the request left the client, matching the streaming behaviour.
 
@@ -52,7 +78,9 @@ How the request body spends the context window:
 | `tool_count` | Number of tool definitions offered |
 | `tools_chars` | Total size of tool definitions (JSON) |
 | `max_tokens` | Requested output cap |
-| `thinking_budget_tokens` | Extended-thinking budget, if enabled |
+| `thinking_type` | `thinking.type` from the request (`adaptive` / `enabled` / `disabled`) |
+| `thinking_budget_tokens` | Extended-thinking budget, if enabled (legacy models) |
+| `effort` | `output_config.effort` (`low`/`medium`/`high`/`xhigh`/`max`), if set |
 | `stream` | Whether the request asked for SSE streaming |
 
 ### Tokenizer
