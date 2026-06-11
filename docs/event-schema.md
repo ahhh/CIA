@@ -33,6 +33,7 @@ Every CIA event is a JSON object. The canonical transport is JSONL (newline-deli
 | `api_generation_start` | First text SSE block opens | `model` |
 | `api_response_end` | `message_stop` SSE event received, or non-streaming response body received | `model`, `tokens_input`, `tokens_output`, `duration_ms` |
 | `api_request_error` | HTTP error response (4xx/5xx) | `error` |
+| `api_progress` | Every ~5s while a stream is in flight — the spinner's data | `model`, `duration_ms` (elapsed), `meta.state` (thinking/responding/waiting), `meta.est_output_tokens` |
 
 `duration_ms` on `api_thinking_end` = wall-clock time from thinking block start to stop.  
 `duration_ms` on `api_response_end` = wall-clock time from HTTP request sent to `message_stop` received (streaming) or full response received (non-streaming).
@@ -78,6 +79,15 @@ Note: `tool_call_end` events may also set `error` when the tool returned a non-f
 | Phase | Emitted when | Key fields set |
 |---|---|---|
 | `file_change` | `fswatch` reports a create/update/delete/rename | `meta.path`, `meta.watch_dir` |
+
+### Claude Code native telemetry (OTLP receiver)
+
+When launched via `cia run`, Claude Code exports its own OpenTelemetry stream to CIA's OTLP receiver (port 4318). These events carry the true `session_id` (from the `session.id` attribute).
+
+| Phase | Emitted when | Key fields set |
+|---|---|---|
+| `otel_metric` | Claude Code exports a metric data point (e.g. `claude_code.token.usage`, `claude_code.cost.usage`, `claude_code.lines_of_code.count`, `claude_code.commit.count`) | `session_id`, `meta.name`, `meta.value`, `meta.unit`, `meta.attributes` |
+| `otel_event` | Claude Code exports a log event (e.g. `api_request`, `api_error`, `tool_result`, `user_prompt`) | `session_id`, `meta.name`, `meta.attributes`, `meta.severity` |
 
 ### Session tracking
 

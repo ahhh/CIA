@@ -37,10 +37,12 @@ class SSEParser:
         flow_id: str,
         emit: Callable[[Event], None],
         session_id: Optional[str] = None,
+        progress_interval_s: float = 5.0,
     ) -> None:
         self._flow_id = flow_id
         self._emit = emit
         self._session_id = session_id
+        self.progress_interval_s = progress_interval_s
 
         self._buf = b""
 
@@ -65,6 +67,11 @@ class SSEParser:
         self._thinking_ms: float = 0.0
         self._stop_reason: Optional[str] = None
 
+        # In-flight progress (the data behind Claude Code's spinner line)
+        self._out_chars: int = 0
+        self._last_progress_ts: Optional[float] = None
+        self._stopped: bool = False
+
     def set_request_start(self, ts: float) -> None:
         self._request_start_ts = ts
 
@@ -82,6 +89,7 @@ class SSEParser:
         while b"\n\n" in self._buf:
             raw, self._buf = self._buf.split(b"\n\n", 1)
             self._process_raw_event(raw.decode("utf-8", errors="replace"))
+        self._maybe_emit_progress(time.time())
 
     def flush(self) -> None:
         """Process any trailing data that lacks a trailing blank line."""
@@ -217,9 +225,13 @@ class SSEParser:
             if self._first_text_token_ts is None:
                 self._first_text_token_ts = now
             self._last_text_token_ts = now
+            self._out_chars += len(delta.get("text") or "")
         # tool_use arguments stream as input_json_delta; count them as generation too
         elif dtype == "input_json_delta":
             self._last_text_token_ts = now
+            self._out_chars += len(delta.get("partial_json") or "")
+        elif dtype == "thinking_delta":
+            self._out_chars += len(delta.get("thinking") or "")
 
     def _on_block_stop(self, data: dict, now: float) -> None:
         idx = data.get("index", 0)
@@ -251,7 +263,44 @@ class SSEParser:
                       "block_type": btype},
             ))
 
+    def _maybe_emit_progress(self, now: float) -> None:
+        """Emit an api_progress snapshot at most once per interval while the
+        stream is live — the same signal Claude Code's spinner renders
+        (elapsed · tokens so far · thinking/responding)."""
+        if self._message_start_ts is None or self._stopped:
+            return
+        if self._last_progress_ts is None:
+            self._last_progress_ts = self._message_start_ts
+        if now - self._last_progress_ts < self.progress_interval_s:
+            return
+        self._last_progress_ts = now
+
+        open_types = {t for t, _ in self._block_open.values()}
+        if "thinking" in open_types:
+            state = "thinking"
+        elif open_types:
+            state = "responding"
+        else:
+            state = "waiting"
+
+        self._emit(Event(
+            phase=Phase.API_PROGRESS,
+            ts=now,
+            session_id=self._session_id,
+            model=self._model,
+            duration_ms=self._ms_since_start(now),
+            meta={
+                "flow_id": self._flow_id,
+                "state": state,
+                "output_chars": self._out_chars,
+                # the spinner's "↓ N tokens" is an estimate; ~4 chars/token
+                "est_output_tokens": self._out_chars // 4,
+                "blocks_done": len(self._blocks),
+            },
+        ))
+
     def _on_message_stop(self, now: float) -> None:
+        self._stopped = True
         total_ms = self._ms_since_start(now)
         ttfb_ms = (
             (self._message_start_ts - self._request_start_ts) * 1000

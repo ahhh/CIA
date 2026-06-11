@@ -18,6 +18,8 @@ External, passive monitor for Claude Code sessions. Observes API call latency, t
 | Context compaction | Claude Code PreCompact hook |
 | Claude waiting / permission prompts | Claude Code Notification hook |
 | Tool call start/end/error (+ output size) | Claude Code PreToolUse/PostToolUse hooks |
+| In-flight stream progress (elapsed · ~tokens · thinking/responding — the spinner's data) | SSE stream parsing (`api_progress` every 5s) |
+| Claude Code native telemetry: cost, token usage, lines of code, commits (`otel_metric` / `otel_event`) | Built-in OTLP receiver on :4318 |
 | File I/O in watched dirs | `fswatch` subprocess |
 
 ## Output format
@@ -74,10 +76,10 @@ cia trust-cert
 # Install Claude Code hooks into current project
 cia install-hooks
 
-# Run Claude with the proxy
-HTTPS_PROXY=http://127.0.0.1:8080 \
-NODE_EXTRA_CA_CERTS=~/.mitmproxy/mitmproxy-ca-cert.pem \
-claude
+# Run Claude fully wired into CIA (proxy + native telemetry).
+# This is the step people forget — without it you get hook events only,
+# no API timing, no thinking phases, no tokenizer.
+cia run claude
 
 # Watch events live
 cia tail
@@ -93,8 +95,9 @@ cia start
 ## CLI reference
 
 ```
-cia start [--proxy-port 8080] [--hook-port 7171] [--db PATH] [--jsonl PATH]
-          [--watch-dir DIR] [--foreground]
+cia start [--proxy-port 8080] [--hook-port 7171] [--otlp-port 4318]
+          [--db PATH] [--jsonl PATH] [--watch-dir DIR] [--foreground]
+cia run [--proxy-port 8080] [--otlp-port 4318] [COMMAND...]   # default: claude
 cia stop
 cia status
 cia export [--format jsonl|csv] [--session ID] [--since EPOCH] [-o FILE]

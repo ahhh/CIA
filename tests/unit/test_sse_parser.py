@@ -198,3 +198,50 @@ class TestEdgeCases:
         # message_stop with no prior message_start emits response_end
         phases = {e.phase for e in events}
         assert Phase.API_RESPONSE_END in phases
+
+
+class TestProgress:
+    def _delta(self, idx, dtype, key, text):
+        return {
+            "_event": "content_block_delta",
+            "type": "content_block_delta",
+            "index": idx,
+            "delta": {"type": dtype, key: text},
+        }
+
+    def test_progress_emitted_during_thinking(self):
+        p, events = _parser()
+        p.progress_interval_s = 0.0   # emit on every feed while streaming
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(self._delta(0, "thinking_delta", "thinking", "x" * 400)))
+
+        progress = [e for e in events if e.phase == Phase.API_PROGRESS]
+        assert progress, "expected api_progress while stream is live"
+        last = progress[-1]
+        assert last.meta["state"] == "thinking"
+        assert last.meta["output_chars"] == 400
+        assert last.meta["est_output_tokens"] == 100
+        assert last.duration_ms is not None
+
+    def test_progress_state_responding_and_stops_after_message_stop(self):
+        p, events = _parser()
+        p.progress_interval_s = 0.0
+        p.feed(_sse(_message_start(), _block_start(0, "text")))
+        p.feed(_sse(self._delta(0, "text_delta", "text", "hello world")))
+        responding = [e for e in events if e.phase == Phase.API_PROGRESS]
+        assert responding[-1].meta["state"] == "responding"
+
+        p.feed(_sse(_block_stop(0), _message_delta(), _message_stop()))
+        n = len([e for e in events if e.phase == Phase.API_PROGRESS])
+        p.feed(b"")   # further feeds emit nothing once stopped
+        assert len([e for e in events if e.phase == Phase.API_PROGRESS]) == n
+
+    def test_no_progress_by_default_for_fast_streams(self):
+        p, events = _parser()   # default 5s interval
+        p.feed(_sse(
+            _message_start(), _block_start(0, "text"),
+            self._delta(0, "text_delta", "text", "hi"),
+            _block_stop(0), _message_delta(), _message_stop(),
+        ))
+        assert not [e for e in events if e.phase == Phase.API_PROGRESS]

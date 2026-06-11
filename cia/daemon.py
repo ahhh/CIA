@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from cia.hook_receiver import HookReceiver
+from cia.otlp_receiver import OTLPReceiver
 from cia.proxy import ProxyThread
 from cia.schema import Event
 from cia.socket_server import SocketServer
@@ -35,6 +36,7 @@ class Daemon:
         proxy_port: int = 8080,
         hook_host: str = "127.0.0.1",
         hook_port: int = 7171,
+        otlp_port: int = 4318,
         socket_path: Path = CIA_DIR / "cia.sock",
         watch_dirs: Optional[list[Path]] = None,
     ) -> None:
@@ -43,6 +45,7 @@ class Daemon:
         self._proxy_port = proxy_port
         self._hook_host = hook_host
         self._hook_port = hook_port
+        self._otlp_port = otlp_port
         self._socket_path = socket_path
         self._watch_dirs: list[Path] = watch_dirs or []
 
@@ -90,6 +93,9 @@ class Daemon:
             asyncio.create_task(hook_receiver.start(), name="hooks"),
             asyncio.create_task(socket_server.start(), name="socket"),
         ]
+        if self._otlp_port > 0:
+            otlp = OTLPReceiver(self._emit, self._hook_host, self._otlp_port)
+            self._tasks.append(asyncio.create_task(otlp.start(), name="otlp"))
         for d in self._watch_dirs:
             watcher = FsWatcher(d, self._emit)
             self._tasks.append(

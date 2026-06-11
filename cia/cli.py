@@ -81,11 +81,12 @@ def main():
 @main.command()
 @click.option("--proxy-port", default=8080, show_default=True, help="mitmproxy listen port")
 @click.option("--hook-port",  default=7171, show_default=True, help="Hook receiver port")
+@click.option("--otlp-port",  default=4318, show_default=True, help="OTLP telemetry receiver port (0 to disable)")
 @click.option("--db",         default=str(CIA_DIR / "cia.db"), show_default=True, help="SQLite path")
 @click.option("--jsonl",      default=str(CIA_DIR / "events.jsonl"), show_default=True, help="JSONL mirror path")
 @click.option("--watch-dir",  "watch_dirs", multiple=True, type=click.Path(), help="Dirs to watch (repeatable)")
 @click.option("--foreground", is_flag=True, help="Run in foreground (no fork)")
-def start(proxy_port, hook_port, db, jsonl, watch_dirs, foreground):
+def start(proxy_port, hook_port, otlp_port, db, jsonl, watch_dirs, foreground):
     """Start the CIA monitoring daemon."""
     if SOCKET_PATH.exists():
         console.print("[yellow]CIA daemon appears to already be running. "
@@ -97,6 +98,7 @@ def start(proxy_port, hook_port, db, jsonl, watch_dirs, foreground):
         jsonl_path=Path(jsonl),
         proxy_port=proxy_port,
         hook_port=hook_port,
+        otlp_port=otlp_port,
         watch_dirs=[Path(d) for d in watch_dirs],
     )
 
@@ -134,6 +136,64 @@ def start(proxy_port, hook_port, db, jsonl, watch_dirs, foreground):
 def _run_daemon(kwargs: dict) -> None:
     from cia.daemon import run_daemon
     asyncio.run(run_daemon(**kwargs))
+
+
+# ------------------------------------------------------------------ #
+# run                                                                  #
+# ------------------------------------------------------------------ #
+
+def _build_run_env(proxy_port: int = 8080, otlp_port: int = 4318,
+                   cert: Path | None = None) -> dict:
+    """Env vars that route a child process through CIA's collectors."""
+    cert = cert or Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
+    return {
+        # Route HTTPS through the mitmproxy collector
+        "HTTPS_PROXY": f"http://127.0.0.1:{proxy_port}",
+        "NODE_EXTRA_CA_CERTS": str(cert),
+        # Claude Code native telemetry → CIA's OTLP receiver
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{otlp_port}",
+        "OTEL_METRIC_EXPORT_INTERVAL": "10000",
+        "OTEL_LOGS_EXPORT_INTERVAL": "5000",
+    }
+
+
+@main.command(context_settings={"ignore_unknown_options": True})
+@click.option("--proxy-port", default=8080, show_default=True)
+@click.option("--otlp-port",  default=4318, show_default=True)
+@click.argument("command", nargs=-1, type=click.UNPROCESSED)
+def run(proxy_port, otlp_port, command):
+    """Launch a command (default: claude) fully wired into CIA.
+
+    Sets HTTPS_PROXY + the mitmproxy CA cert so API traffic is captured,
+    and enables Claude Code's native OpenTelemetry export pointed at
+    CIA's OTLP receiver.  Example:
+
+        cia run claude
+        cia run -- claude --continue
+    """
+    argv = list(command) or ["claude"]
+    cert = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
+
+    if not SOCKET_PATH.exists():
+        console.print("[yellow]Warning: CIA daemon not running — "
+                      "events will not be captured. Run: cia start[/yellow]")
+    if not cert.exists():
+        console.print(f"[yellow]Warning: {cert} not found — run 'cia start' "
+                      "once to generate it, and 'cia trust-cert'.[/yellow]")
+
+    env = dict(os.environ)
+    env.update(_build_run_env(proxy_port, otlp_port, cert))
+    console.print(f"[green]cia run:[/green] [cyan]{' '.join(argv)}[/cyan] "
+                  f"[dim](proxy :{proxy_port}, otlp :{otlp_port})[/dim]")
+    try:
+        os.execvpe(argv[0], argv, env)
+    except FileNotFoundError:
+        console.print(f"[red]Command not found: {argv[0]}[/red]")
+        sys.exit(127)
 
 
 # ------------------------------------------------------------------ #
@@ -279,6 +339,17 @@ def _event_extra(evt: dict) -> str:
         parts.append(f"trigger={meta['trigger']}")
     if phase == "notification" and meta.get("message"):
         parts.append(f"msg={meta['message'][:80]!r}")
+    if phase == "api_progress":
+        parts.append(f"{meta.get('state')} ~{meta.get('est_output_tokens')}tok")
+    if phase == "otel_metric":
+        val = meta.get("value")
+        val = f"{val:.4f}" if isinstance(val, float) else val
+        parts.append(f"{meta.get('name')}={val}")
+        for k in ("type", "model"):
+            if (meta.get("attributes") or {}).get(k):
+                parts.append(f"{k}={meta['attributes'][k]}")
+    if phase == "otel_event":
+        parts.append(str(meta.get("name")))
     tr = meta.get("tool_result") or {}
     if tr:
         if tr.get("is_error"):
@@ -306,6 +377,10 @@ def _event_extra(evt: dict) -> str:
 def _phase_colour(phase: str) -> str:
     if "error" in phase:
         return "red"
+    if "progress" in phase:
+        return "dim cyan"
+    if "otel" in phase:
+        return "bright_green"
     if "thinking" in phase:
         return "magenta"
     if "tokenizer" in phase:

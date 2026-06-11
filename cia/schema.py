@@ -18,6 +18,7 @@ class Phase(str, Enum):
     API_GENERATION_END   = "api_generation_end"
     API_RESPONSE_END     = "api_response_end"
     API_REQUEST_ERROR    = "api_request_error"
+    API_PROGRESS         = "api_progress"      # periodic in-flight stream progress
 
     # Tokenizer (server-side token counting via /v1/messages/count_tokens)
     TOKENIZER_START = "tokenizer_start"
@@ -30,6 +31,10 @@ class Phase(str, Enum):
 
     # File system (from fswatch)
     FILE_CHANGE = "file_change"
+
+    # Claude Code native telemetry (OTLP receiver)
+    OTEL_METRIC = "otel_metric"
+    OTEL_EVENT  = "otel_event"
 
     # Session / agent lifecycle (from Claude Code hooks)
     PROCESS_SPAWN   = "process_spawn"
