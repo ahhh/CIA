@@ -92,6 +92,8 @@ class Event:
         meta = {k: v for k, v in payload.items()
                 if k not in ("session_id", "tool_name", "tool_input",
                               "tool_response", "hook_event_name")}
+        meta.update(_tool_target(payload.get("tool_name"),
+                                  payload.get("tool_input")))
         result = _summarize_tool_response(phase, payload)
         if result is not None:
             meta["tool_result"] = result
@@ -103,6 +105,40 @@ class Event:
             error=_extract_hook_error(phase, payload),
             meta=meta,
         )
+
+
+_PATH_KEYS = ("file_path", "notebook_path")
+
+
+def _tool_target(tool_name: Optional[str], tool_input: Optional[dict]) -> dict:
+    """Lift the most useful identifier out of a tool's input into flat meta
+    fields, so events are greppable without parsing tool_input JSON:
+
+      Read / Write / Edit / MultiEdit / NotebookEdit → meta["path"]
+      Bash                                           → meta["command"]
+      Grep / Glob                                    → meta["pattern"] (+ search root → meta["target"])
+      WebFetch / WebSearch                           → meta["target"]
+    """
+    if not isinstance(tool_input, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k in _PATH_KEYS:
+        v = tool_input.get(k)
+        if isinstance(v, str) and v:
+            out["path"] = v
+            break
+    if tool_name == "Bash" and isinstance(tool_input.get("command"), str):
+        out["command"] = tool_input["command"][:300]
+    elif tool_name in ("Grep", "Glob"):
+        if tool_input.get("pattern"):
+            out["pattern"] = str(tool_input["pattern"])
+        if tool_input.get("path"):
+            out["target"] = str(tool_input["path"])
+    elif tool_name in ("WebFetch", "WebSearch"):
+        tgt = tool_input.get("url") or tool_input.get("query")
+        if tgt:
+            out["target"] = str(tgt)
+    return out
 
 
 def _summarize_tool_response(phase: Phase, payload: dict) -> Optional[dict]:

@@ -85,13 +85,24 @@ def main():
 @click.option("--db",         default=str(CIA_DIR / "cia.db"), show_default=True, help="SQLite path")
 @click.option("--jsonl",      default=str(CIA_DIR / "events.jsonl"), show_default=True, help="JSONL mirror path")
 @click.option("--watch-dir",  "watch_dirs", multiple=True, type=click.Path(), help="Dirs to watch (repeatable)")
+@click.option("--watch-claude/--no-watch-claude", default=True, show_default=True,
+              help="Also watch Claude Code's own memory/session/transcript data for this project")
 @click.option("--foreground", is_flag=True, help="Run in foreground (no fork)")
-def start(proxy_port, hook_port, otlp_port, db, jsonl, watch_dirs, foreground):
+def start(proxy_port, hook_port, otlp_port, db, jsonl, watch_dirs, watch_claude, foreground):
     """Start the CIA monitoring daemon."""
     if SOCKET_PATH.exists():
         console.print("[yellow]CIA daemon appears to already be running. "
                       "Use 'cia stop' first.[/yellow]")
         sys.exit(1)
+
+    resolved_watch = [Path(d) for d in watch_dirs]
+    if watch_claude:
+        from cia.claude_paths import claude_watch_dirs
+        claude_dirs = claude_watch_dirs(Path.cwd())
+        resolved_watch.extend(claude_dirs)
+        if claude_dirs:
+            console.print(f"  Claude data: [cyan]watching {len(claude_dirs)} "
+                          f"dir(s)[/cyan] [dim]({', '.join(d.name for d in claude_dirs)})[/dim]")
 
     kwargs = dict(
         db_path=Path(db),
@@ -99,7 +110,7 @@ def start(proxy_port, hook_port, otlp_port, db, jsonl, watch_dirs, foreground):
         proxy_port=proxy_port,
         hook_port=hook_port,
         otlp_port=otlp_port,
-        watch_dirs=[Path(d) for d in watch_dirs],
+        watch_dirs=resolved_watch,
     )
 
     if foreground:
@@ -339,6 +350,20 @@ def _event_extra(evt: dict) -> str:
         parts.append(f"trigger={meta['trigger']}")
     if phase == "notification" and meta.get("message"):
         parts.append(f"msg={meta['message'][:80]!r}")
+    if phase in ("tool_call_start", "tool_call_end", "tool_call_error"):
+        if meta.get("path"):
+            parts.append(f"path={meta['path']}")
+        elif meta.get("command"):
+            parts.append(f"$ {meta['command'][:60]}")
+        elif meta.get("pattern"):
+            parts.append(f"/{meta['pattern']}/")
+        elif meta.get("target"):
+            parts.append(str(meta["target"])[:60])
+    if phase == "file_change":
+        if meta.get("category"):
+            parts.append(f"[{meta['category']}]")
+        fp = meta.get("path", "")
+        parts.append(fp if len(fp) <= 80 else "…" + fp[-79:])
     if phase == "api_progress":
         parts.append(f"{meta.get('state')} ~{meta.get('est_output_tokens')}tok")
     if phase == "otel_metric":
@@ -361,6 +386,13 @@ def _event_extra(evt: dict) -> str:
         parts.append(f"ttft={lat['ttft_ms']:.0f}ms")
     if lat.get("thinking_ms") is not None:
         parts.append(f"think={lat['thinking_ms']:.0f}ms")
+    if phase == "api_thinking_end" and meta.get("est_thinking_tokens"):
+        parts.append(f"~{meta['est_thinking_tokens']}tok")
+    think = meta.get("thinking") or {}
+    if think.get("est_thinking_tokens"):
+        frac = think.get("thinking_output_frac")
+        suffix = f" ({frac:.0%} of out)" if isinstance(frac, (int, float)) else ""
+        parts.append(f"think~{think['est_thinking_tokens']}tok{suffix}")
     if lat.get("output_tokens_per_sec") is not None:
         parts.append(f"{lat['output_tokens_per_sec']:.0f}tok/s")
     if meta.get("cache_read_input_tokens"):

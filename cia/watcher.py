@@ -8,6 +8,7 @@ import asyncio
 from pathlib import Path
 from typing import Callable
 
+from cia.claude_paths import classify_path
 from cia.schema import Event, Phase
 
 
@@ -47,10 +48,12 @@ class FsWatcher:
                     break
                 path = line.decode("utf-8", errors="replace").strip()
                 if path:
-                    self._emit(Event(
-                        phase=Phase.FILE_CHANGE,
-                        meta={"path": path, "watch_dir": str(self._dir)},
-                    ))
+                    meta = {"path": path, "watch_dir": str(self._dir)}
+                    category = classify_path(path)
+                    if category:
+                        meta["category"] = category
+                        meta["filename"] = Path(path).name
+                    self._emit(Event(phase=Phase.FILE_CHANGE, meta=meta))
         except (FileNotFoundError, asyncio.CancelledError):
             pass
         finally:

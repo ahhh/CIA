@@ -245,3 +245,41 @@ class TestProgress:
             _block_stop(0), _message_delta(), _message_stop(),
         ))
         assert not [e for e in events if e.phase == Phase.API_PROGRESS]
+
+
+class TestThinkingTokens:
+    def _delta(self, idx, dtype, key, text):
+        return {
+            "_event": "content_block_delta",
+            "type": "content_block_delta",
+            "index": idx,
+            "delta": {"type": dtype, key: text},
+        }
+
+    def test_thinking_end_estimates_tokens(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(self._delta(0, "thinking_delta", "thinking", "x" * 400)))
+        p.feed(_sse(_block_stop(0)))
+
+        end = next(e for e in events if e.phase is Phase.API_THINKING_END)
+        assert end.thinking_tokens == 100          # 400 chars // 4
+        assert end.meta["thinking_chars"] == 400
+        assert end.meta["est_thinking_tokens"] == 100
+
+    def test_response_end_thinking_summary(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.feed(_sse(_message_start(), _block_start(0, "thinking")))
+        p.feed(_sse(self._delta(0, "thinking_delta", "thinking", "y" * 800)))
+        p.feed(_sse(_block_stop(0), _block_start(1, "text")))
+        p.feed(_sse(self._delta(1, "text_delta", "text", "answer")))
+        p.feed(_sse(_block_stop(1), _message_delta(output_tokens=200), _message_stop()))
+
+        end = next(e for e in events if e.phase is Phase.API_RESPONSE_END)
+        think = end.meta["thinking"]
+        assert think["blocks"] == 1
+        assert think["est_thinking_tokens"] == 200    # 800 // 4
+        assert think["thinking_output_frac"] == 1.0   # 200 est / 200 output
+        assert end.thinking_tokens == 200

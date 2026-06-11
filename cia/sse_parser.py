@@ -55,6 +55,8 @@ class SSEParser:
 
         # Per-block bookkeeping: index → (type, start_ts)
         self._block_open: dict[int, tuple[str, float]] = {}
+        # Per-block streamed character count (index → chars), for token estimates
+        self._block_chars: dict[int, int] = {}
         # Completed blocks: list of {"type", "duration_ms"}
         self._blocks: list[dict] = []
 
@@ -65,6 +67,8 @@ class SSEParser:
         self._cache_read: int = 0
         self._cache_creation: int = 0
         self._thinking_ms: float = 0.0
+        self._thinking_chars: int = 0       # chars streamed inside thinking blocks
+        self._thinking_blocks: int = 0      # count of thinking blocks
         self._stop_reason: Optional[str] = None
 
         # In-flight progress (the data behind Claude Code's spinner line)
@@ -225,13 +229,20 @@ class SSEParser:
             if self._first_text_token_ts is None:
                 self._first_text_token_ts = now
             self._last_text_token_ts = now
-            self._out_chars += len(delta.get("text") or "")
+            n = len(delta.get("text") or "")
+            self._out_chars += n
+            self._block_chars[idx] = self._block_chars.get(idx, 0) + n
         # tool_use arguments stream as input_json_delta; count them as generation too
         elif dtype == "input_json_delta":
             self._last_text_token_ts = now
-            self._out_chars += len(delta.get("partial_json") or "")
+            n = len(delta.get("partial_json") or "")
+            self._out_chars += n
+            self._block_chars[idx] = self._block_chars.get(idx, 0) + n
         elif dtype == "thinking_delta":
-            self._out_chars += len(delta.get("thinking") or "")
+            n = len(delta.get("thinking") or "")
+            self._out_chars += n
+            self._thinking_chars += n
+            self._block_chars[idx] = self._block_chars.get(idx, 0) + n
 
     def _on_block_stop(self, data: dict, now: float) -> None:
         idx = data.get("index", 0)
@@ -242,15 +253,28 @@ class SSEParser:
         duration_ms = (now - start_ts) * 1000
         self._blocks.append({"type": btype, "index": idx, "duration_ms": duration_ms})
 
+        block_chars = self._block_chars.pop(idx, 0)
+
         if btype == "thinking":
             self._thinking_ms += duration_ms
+            self._thinking_blocks += 1
+            # ~4 chars/token, matching the spinner estimate elsewhere.
+            est_tokens = block_chars // 4 if block_chars else None
+            think_tok_per_sec = (
+                round(est_tokens / (duration_ms / 1000), 1)
+                if est_tokens and duration_ms > 0 else None
+            )
             self._emit(Event(
                 phase=Phase.API_THINKING_END,
                 ts=now,
                 session_id=self._session_id,
                 model=self._model,
                 duration_ms=duration_ms,
-                meta={"flow_id": self._flow_id, "block_index": idx},
+                thinking_tokens=est_tokens,
+                meta={"flow_id": self._flow_id, "block_index": idx,
+                      "thinking_chars": block_chars,
+                      "est_thinking_tokens": est_tokens,
+                      "thinking_tokens_per_sec": think_tok_per_sec},
             ))
         elif btype in ("text", "tool_use"):
             self._emit(Event(
@@ -335,6 +359,24 @@ class SSEParser:
             "cache_creation_input_tokens": self._cache_creation,
         }
 
+        # Thinking summary: depth (est. tokens/chars), block count, and how
+        # much of the turn's wall-clock and output budget went to reasoning.
+        est_thinking_tokens = self._thinking_chars // 4 if self._thinking_chars else None
+        thinking = {
+            "blocks": self._thinking_blocks,
+            "thinking_ms": round(self._thinking_ms, 1) if self._thinking_ms else None,
+            "est_thinking_tokens": est_thinking_tokens,
+            "thinking_chars": self._thinking_chars or None,
+            "thinking_time_frac": (
+                round(self._thinking_ms / total_ms, 3)
+                if self._thinking_ms and total_ms else None
+            ),
+            "thinking_output_frac": (
+                round(est_thinking_tokens / self._tokens_output, 3)
+                if est_thinking_tokens and self._tokens_output else None
+            ),
+        }
+
         self._emit(Event(
             phase=Phase.API_RESPONSE_END,
             ts=now,
@@ -342,12 +384,14 @@ class SSEParser:
             model=self._model,
             tokens_input=self._tokens_input,
             tokens_output=self._tokens_output,
+            thinking_tokens=est_thinking_tokens,
             duration_ms=total_ms,
             meta={
                 "flow_id": self._flow_id,
                 "stop_reason": self._stop_reason,
                 "latency": latency,
                 "usage": usage,
+                "thinking": thinking,
                 "content_blocks": self._blocks,
             },
         ))
