@@ -27,15 +27,26 @@ Every CIA event is a JSON object. The canonical transport is JSONL (newline-deli
 
 | Phase | Emitted when | Key fields set |
 |---|---|---|
-| `api_request_start` | mitmproxy sees the POST to api.anthropic.com (via `message_start` SSE) | `model`, `tokens_input` |
+| `api_request_start` | mitmproxy sees the POST to api.anthropic.com (via `message_start` SSE, or the HTTP roundtrip for non-streaming calls) | `model`, `tokens_input` |
 | `api_thinking_start` | First thinking SSE block opens | `model` |
 | `api_thinking_end` | Thinking SSE block closes | `model`, `duration_ms` |
 | `api_generation_start` | First text SSE block opens | `model` |
-| `api_response_end` | `message_stop` SSE event received | `model`, `tokens_input`, `tokens_output`, `duration_ms` |
+| `api_response_end` | `message_stop` SSE event received, or non-streaming response body received | `model`, `tokens_input`, `tokens_output`, `duration_ms` |
 | `api_request_error` | HTTP error response (4xx/5xx) | `error` |
 
 `duration_ms` on `api_thinking_end` = wall-clock time from thinking block start to stop.  
-`duration_ms` on `api_response_end` = wall-clock time from HTTP request sent to `message_stop` received.
+`duration_ms` on `api_response_end` = wall-clock time from HTTP request sent to `message_stop` received (streaming) or full response received (non-streaming).
+
+Non-streaming `/v1/messages` calls have no thinking/generation sub-phases; their events carry `meta.streaming: false`. The `ts` on their `api_request_start` is backdated to when the request left the client, matching the streaming behaviour.
+
+### Tokenizer
+
+Claude Code counts tokens server-side via `POST /v1/messages/count_tokens`; CIA times the roundtrip.
+
+| Phase | Emitted when | Key fields set |
+|---|---|---|
+| `tokenizer_start` | count_tokens request leaves the client | `model` |
+| `tokenizer_end` | count_tokens response received | `model`, `tokens_input` (the counted tokens), `duration_ms` |
 
 ### Tool calls
 

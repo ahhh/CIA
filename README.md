@@ -6,7 +6,8 @@ External, passive monitor for Claude Code sessions. Observes API call latency, t
 
 | Signal | How |
 |---|---|
-| Anthropic API request + response timing | mitmproxy intercepts HTTPS |
+| Anthropic API request + response timing (streaming and non-streaming) | mitmproxy intercepts HTTPS |
+| Tokenizer runs (`count_tokens` calls): when + duration + counted tokens | mitmproxy intercepts HTTPS |
 | Latency breakdown (TTFB, time-to-first-token, generation, tokens/sec) | SSE stream parsing |
 | Model thinking phase start/end | SSE stream parsing |
 | Text generation start/end + cache token usage | SSE stream parsing |

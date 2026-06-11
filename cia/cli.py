@@ -308,6 +308,8 @@ def _phase_colour(phase: str) -> str:
         return "red"
     if "thinking" in phase:
         return "magenta"
+    if "tokenizer" in phase:
+        return "bright_cyan"
     if "api" in phase:
         return "cyan"
     if "tool" in phase:

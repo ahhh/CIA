@@ -19,6 +19,10 @@ class Phase(str, Enum):
     API_RESPONSE_END     = "api_response_end"
     API_REQUEST_ERROR    = "api_request_error"
 
+    # Tokenizer (server-side token counting via /v1/messages/count_tokens)
+    TOKENIZER_START = "tokenizer_start"
+    TOKENIZER_END   = "tokenizer_end"
+
     # Tool calls (from Claude Code hooks)
     TOOL_CALL_START  = "tool_call_start"
     TOOL_CALL_END    = "tool_call_end"
