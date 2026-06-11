@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Claude Code (machine-specific settings and local overrides)
+.claude/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# CIA runtime artifacts (sockets, logs, local event stores)
+*.sock
+*.log
+*.db
+*.sqlite*
