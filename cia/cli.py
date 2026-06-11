@@ -354,6 +354,7 @@ def report(session, since, input_file, as_json):
         print(json.dumps(data, indent=2))
         return
 
+    _render_sessions(data["sessions"])
     _render_turns(data["turns"])
     _render_tools(data["tools"])
     _render_human(data["human"])
@@ -386,6 +387,43 @@ def _fmt_s(ms) -> str:
     return f"{ms/1000:.1f}" if ms is not None else "-"
 
 
+def _render_sessions(stories: list) -> None:
+    t = Table(title="Session stories", show_header=True, header_style="bold cyan")
+    for col in ("session", "started", "dur", "turns", "api", "tok in/out",
+                "think s", "tools", "wait s", "coverage"):
+        t.add_column(col, justify="right" if col not in ("session", "started", "coverage") else "left")
+    for s in stories:
+        mins, secs = divmod(int(s["duration_s"]), 60)
+        cov = "".join(
+            f"[green]{k[0].upper()}[/green]" if v else f"[red]{k[0].upper()}[/red]"
+            for k, v in s["coverage"].items()
+        )
+        turns = str(s["turns"]) + (f"+{s['incomplete_turns']}*" if s["incomplete_turns"] else "")
+        t.add_row(
+            s["session_id"][:8],
+            time.strftime("%m-%d %H:%M", time.localtime(s["start_ts"])),
+            f"{mins}m{secs:02d}s",
+            turns, str(s["api_calls"]),
+            f"{s['tokens_input']}/{s['tokens_output']}",
+            f"{s['thinking_ms']/1000:.1f}",
+            f"{s['tool_calls']}" + (f" ({s['tool_errors']}E)" if s["tool_errors"] else ""),
+            f"{s['permission_wait_s'] + s['think_time_s']:.0f}",
+            cov,
+        )
+    console.print(t)
+    console.print("[dim]coverage: H=hooks P=proxy F=fswatch "
+                  "([green]green[/green]=data present, [red]red[/red]=missing); "
+                  "* = turn still open at capture end[/dim]")
+    seen = set()
+    for s in stories:
+        for gap in s["gaps"]:
+            key = (s["session_id"][:8], gap.split("—")[0])
+            if key in seen:
+                continue
+            seen.add(key)
+            console.print(f"  [yellow]{s['session_id'][:8]}[/yellow]: [dim]{gap}[/dim]")
+
+
 def _render_turns(turns: list) -> None:
     t = Table(title="Turn anatomy — where the wall-clock went (seconds)",
               show_header=True, header_style="bold cyan")
@@ -395,7 +433,8 @@ def _render_turns(turns: list) -> None:
     t.add_column("prompt", no_wrap=True, overflow="ellipsis", max_width=28)
     for turn in turns:
         t.add_row(
-            time.strftime("%H:%M:%S", time.localtime(turn["start_ts"])),
+            time.strftime("%H:%M:%S", time.localtime(turn["start_ts"]))
+            + ("" if turn["complete"] else "*"),
             _fmt_s(turn["wall_ms"]), _fmt_s(turn["api_ms"]),
             _fmt_s(turn["thinking_ms"]),
             f"{_fmt_s(turn['tool_ms'])} ({turn['tool_calls']})",

@@ -45,7 +45,8 @@ See [docs/event-schema.md](docs/event-schema.md) for the full field reference.
 
 | Section | What it shows |
 |---|---|
-| Turn anatomy | Each turn's wall-clock split into API time, thinking, tool execution, permission waits, and everything else |
+| Session stories | Per-session rollup (turns, tokens, thinking, tool calls, human wait) plus coverage diagnostics that say *why* a field is blank (e.g. session not proxied) |
+| Turn anatomy | Each turn's wall-clock split into API time, thinking, tool execution, permission waits, and everything else. Turns still open at capture end are kept and marked `*` |
 | Tool profiles | Per-tool duration percentiles (p50/p90/p99), error rates, output sizes |
 | Human latency | Time spent waiting on permission prompts and user input vs Claude actually working |
 | Compaction cost | Context tokens reclaimed by each compaction |

@@ -246,6 +246,10 @@ def turn_anatomy(events: list[Event]) -> list[dict]:
     A turn is user_prompt → the next turn_end in the same session.  api_*
     events are attributed by time window (see module docstring), tool calls
     and permission waits by session + time window.
+
+    A turn still open at the end of the capture (no turn_end yet — in
+    progress, or the session died) is closed at the last event seen for
+    its session and marked ``complete: False`` rather than dropped.
     """
     pairs = pair_tool_calls(events)
     hl = human_latency(events)
@@ -261,6 +265,10 @@ def turn_anatomy(events: list[Event]) -> list[dict]:
             elif e.phase == Phase.TURN_END and open_prompt is not None:
                 turns.append(_one_turn(open_prompt, e, events, pairs, hl))
                 open_prompt = None
+        if open_prompt is not None and sev[-1].ts > open_prompt.ts:
+            turn = _one_turn(open_prompt, sev[-1], events, pairs, hl)
+            turn["complete"] = False
+            turns.append(turn)
 
     turns.sort(key=lambda t: t["start_ts"])
     return turns
@@ -303,6 +311,7 @@ def _one_turn(prompt: Event, end: Event, events: list[Event],
     other_ms = max(0.0, wall_ms - api_ms - tool_ms - permission_s * 1000)
 
     return {
+        "complete": True,
         "session_id": sid,
         "start_ts": t0,
         "wall_ms": wall_ms,
@@ -368,12 +377,102 @@ def rework(events: list[Event], threshold: int = 3) -> list[dict]:
 
 
 # ------------------------------------------------------------------ #
+# Session stories                                                      #
+# ------------------------------------------------------------------ #
+
+def session_stories(events: list[Event]) -> list[dict]:
+    """Per-session rollup with explicit coverage diagnostics.
+
+    Aggregates turns, API usage, tool activity and human latency for each
+    session, and reports which collectors actually contributed data —
+    so an all-zero API column reads as "this session was not proxied"
+    instead of silent dashes.
+    """
+    turns = turn_anatomy(events)
+    hl = human_latency(events)
+    pairs = pair_tool_calls(events)
+
+    stories = []
+    for sid in sorted({e.session_id for e in events if e.session_id}):
+        sev = [e for e in events if e.session_id == sid]
+        t0, t1 = sev[0].ts, sev[-1].ts
+
+        def in_window(ts: float) -> bool:
+            return t0 <= ts <= t1
+
+        api_ends = [e for e in events
+                    if e.phase == Phase.API_RESPONSE_END and in_window(e.ts)]
+        api_starts = [e for e in events
+                      if e.phase == Phase.API_REQUEST_START and in_window(e.ts)]
+        has_proxy = bool(api_ends or api_starts or any(
+            e.phase in (Phase.TOKENIZER_START, Phase.TOKENIZER_END)
+            and in_window(e.ts) for e in events))
+        has_fswatch = any(e.phase == Phase.FILE_CHANGE and in_window(e.ts)
+                          for e in events)
+
+        cache_read = sum((e.meta or {}).get("cache_read_input_tokens") or 0
+                         for e in api_starts)
+        session_turns = [t for t in turns if t["session_id"] == sid]
+        tool_calls = [p for p in pairs if p["session_id"] == sid]
+        end_event = next((e for e in reversed(sev)
+                          if e.phase == Phase.SESSION_END), None)
+
+        gaps = []
+        if not has_proxy:
+            gaps.append("no proxy data — session not routed through CIA "
+                        "(launch claude with HTTPS_PROXY / NODE_EXTRA_CA_CERTS); "
+                        "API, thinking and tokenizer fields are blank")
+        if not has_fswatch:
+            gaps.append("no fswatch data — daemon started without --watch-dir")
+        if not any(e.phase == Phase.TURN_END for e in sev):
+            gaps.append("no turn_end events — Stop hook missing or session "
+                        "still on its first turn")
+
+        stories.append({
+            "session_id": sid,
+            "start_ts": t0,
+            "end_ts": t1,
+            "duration_s": t1 - t0,
+            "ended": end_event is not None,
+            "end_reason": (end_event.meta or {}).get("reason") if end_event else None,
+            "turns": len(session_turns),
+            "incomplete_turns": sum(1 for t in session_turns if not t["complete"]),
+            "prompts": sum(1 for e in sev if e.phase == Phase.USER_PROMPT),
+            "api_calls": len(api_ends),
+            "tokens_input": sum(e.tokens_input or 0 for e in api_ends),
+            "tokens_output": sum(e.tokens_output or 0 for e in api_ends),
+            "cache_read_tokens": cache_read,
+            "thinking_ms": sum(e.duration_ms or 0 for e in events
+                               if e.phase == Phase.API_THINKING_END
+                               and in_window(e.ts)),
+            "models": sorted({e.model for e in api_ends if e.model}),
+            "tool_calls": len(tool_calls),
+            "tool_errors": sum(1 for p in tool_calls if p["is_error"]),
+            "tool_ms": sum(p["duration_ms"] for p in tool_calls),
+            "edits": sum(1 for p in tool_calls
+                         if p["tool"] in _EDIT_TOOLS and p["file_path"]),
+            "permission_wait_s": sum(w["wait_s"] for w in hl["permission_waits"]
+                                     if w["session_id"] == sid),
+            "think_time_s": sum(w["wait_s"] for w in hl["think_times"]
+                                if w["session_id"] == sid),
+            "compactions": sum(1 for e in sev
+                               if e.phase == Phase.CONTEXT_COMPACT),
+            "subagents": sum(1 for e in sev if e.phase == Phase.SUBAGENT_END),
+            "coverage": {"hooks": True, "proxy": has_proxy,
+                         "fswatch": has_fswatch},
+            "gaps": gaps,
+        })
+    return stories
+
+
+# ------------------------------------------------------------------ #
 # Full report                                                          #
 # ------------------------------------------------------------------ #
 
 def full_report(events: list[Event]) -> dict[str, Any]:
     """All derived analytics in one JSON-serialisable dict."""
     return {
+        "sessions": session_stories(events),
         "turns": turn_anatomy(events),
         "tools": tool_profiles(events),
         "human": human_latency(events),

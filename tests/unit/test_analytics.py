@@ -7,6 +7,7 @@ from cia.analytics import (
     human_latency,
     pair_tool_calls,
     rework,
+    session_stories,
     tool_profiles,
     turn_anatomy,
 )
@@ -250,6 +251,64 @@ def test_rework_flags_repeated_edits_in_one_turn():
     assert by_file["/src/fine.py"]["flagged"] is False
 
 
+def test_open_turn_is_kept_and_marked_incomplete():
+    events = (
+        [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "first"}),
+         E(Phase.TURN_END, 5, session_id=SID),
+         E(Phase.USER_PROMPT, 10, session_id=SID, meta={"prompt": "still going"})]
+        + tool_pair(11, "Bash", "t1", dur=2.0)
+    )
+    turns = turn_anatomy(events)
+    assert len(turns) == 2
+    assert turns[0]["complete"] is True
+    open_turn = turns[1]
+    assert open_turn["complete"] is False
+    assert open_turn["prompt"] == "still going"
+    assert open_turn["tool_calls"] == 1
+    assert round(open_turn["wall_ms"]) == 3000   # closed at last session event
+
+
+# ------------------------------------------------------------------ #
+# session_stories                                                      #
+# ------------------------------------------------------------------ #
+
+def test_session_story_aggregates_and_full_coverage():
+    events = (
+        [E(Phase.SESSION_START, 0, session_id=SID, meta={"source": "startup"}),
+         E(Phase.USER_PROMPT, 1, session_id=SID, meta={"prompt": "go"})]
+        + api_call(2, dur=3.0, tokens_in=500, tokens_out=80, cache_read=2000,
+                   thinking=1.0)
+        + tool_pair(6, "Edit", "t1", dur=1.0, file_path="/x.py", is_error=True)
+        + [E(Phase.FILE_CHANGE, 6.5, meta={"path": "/x.py"}),
+           E(Phase.TURN_END, 8, session_id=SID),
+           E(Phase.SESSION_END, 9, session_id=SID, meta={"reason": "exit"})]
+    )
+    stories = session_stories(events)
+    assert len(stories) == 1
+    s = stories[0]
+    assert s["turns"] == 1 and s["incomplete_turns"] == 0
+    assert s["api_calls"] == 1
+    assert s["tokens_input"] == 500 and s["tokens_output"] == 80
+    assert s["cache_read_tokens"] == 2000
+    assert round(s["thinking_ms"]) == 1000
+    assert s["tool_calls"] == 1 and s["tool_errors"] == 1 and s["edits"] == 1
+    assert s["ended"] is True and s["end_reason"] == "exit"
+    assert s["models"] == ["m"]
+    assert s["coverage"] == {"hooks": True, "proxy": True, "fswatch": True}
+    assert s["gaps"] == []
+
+
+def test_session_story_flags_missing_proxy_coverage():
+    events = [
+        E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "hi"}),
+        E(Phase.TURN_END, 5, session_id=SID),
+    ]
+    s = session_stories(events)[0]
+    assert s["coverage"]["proxy"] is False
+    assert any("no proxy data" in g for g in s["gaps"])
+    assert s["api_calls"] == 0
+
+
 def test_full_report_shape():
     events = (
         [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "x"})]
@@ -258,6 +317,7 @@ def test_full_report_shape():
         + [E(Phase.TURN_END, 6, session_id=SID)]
     )
     report = full_report(events)
-    assert set(report) == {"turns", "tools", "human", "compactions", "rework"}
+    assert set(report) == {"sessions", "turns", "tools", "human",
+                           "compactions", "rework"}
     assert len(report["turns"]) == 1
     assert report["tools"][0]["tool"] == "Bash"
