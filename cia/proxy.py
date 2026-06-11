@@ -182,11 +182,15 @@ class CIAAddon:
 
 
 def _make_stream_transformer(parser: SSEParser):
-    """Return a mitmproxy stream callable that feeds each chunk into the parser."""
-    def transform(chunks):
-        for chunk in chunks:
-            parser.feed(chunk)
-            yield chunk
+    """Return a mitmproxy stream callable that feeds each chunk into the parser.
+
+    mitmproxy >= 7 calls this once per chunk as ``stream(data: bytes)`` and
+    sends ``b""`` at end-of-message; the chunk must be returned unmodified.
+    """
+    def transform(data: bytes) -> bytes:
+        if data:
+            parser.feed(data)
+        return data
     return transform
 
 
