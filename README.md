@@ -7,10 +7,16 @@ External, passive monitor for Claude Code sessions. Observes API call latency, t
 | Signal | How |
 |---|---|
 | Anthropic API request + response timing | mitmproxy intercepts HTTPS |
+| Latency breakdown (TTFB, time-to-first-token, generation, tokens/sec) | SSE stream parsing |
 | Model thinking phase start/end | SSE stream parsing |
-| Text generation start | SSE stream parsing |
-| Tool call start/end/error | Claude Code PreToolUse/PostToolUse hooks |
-| Session end | Claude Code Stop hook |
+| Text generation start/end + cache token usage | SSE stream parsing |
+| User prompt submitted (+ prompt text) | Claude Code UserPromptSubmit hook |
+| Session start / end (+ source / reason) | Claude Code SessionStart / SessionEnd hooks |
+| Assistant turn end | Claude Code Stop hook |
+| Subagent finished | Claude Code SubagentStop hook |
+| Context compaction | Claude Code PreCompact hook |
+| Claude waiting / permission prompts | Claude Code Notification hook |
+| Tool call start/end/error (+ output size) | Claude Code PreToolUse/PostToolUse hooks |
 | File I/O in watched dirs | `fswatch` subprocess |
 
 ## Output format

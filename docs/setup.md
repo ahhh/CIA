@@ -69,9 +69,12 @@ Or globally (monitors all projects):
 cia install-hooks --global  # writes to ~/.claude/settings.json
 ```
 
-This writes three shell scripts to `~/.cia/hooks/` and registers them as
-`PreToolUse`, `PostToolUse`, and `Stop` hooks. Each script runs `curl` to
-POST the hook payload to `http://127.0.0.1:7171/hook/<type>`.
+This writes one shell script per hook to `~/.cia/hooks/` and registers them
+as `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+`Notification`, `PreCompact`, `SubagentStop`, `Stop`, and `SessionEnd` hooks.
+Each script runs `curl` to POST the hook payload to
+`http://127.0.0.1:7171/hook/<type>`. Note that `Stop` marks the end of each
+assistant *turn*; `SessionEnd` marks actual session termination.
 
 If CIA is not running, the hooks exit silently (`|| true`) so they never
 block Claude.

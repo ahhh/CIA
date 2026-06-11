@@ -5,23 +5,44 @@ Claude Code hooks are shell scripts installed in .claude/settings.json.
 Each script reads JSON from stdin and POSTs it here.
 
 Endpoints:
-  POST /hook/pre   — PreToolUse
-  POST /hook/post  — PostToolUse
-  POST /hook/stop  — Stop
+  POST /hook/session-start — SessionStart
+  POST /hook/prompt        — UserPromptSubmit
+  POST /hook/pre           — PreToolUse
+  POST /hook/post          — PostToolUse
+  POST /hook/notification  — Notification
+  POST /hook/pre-compact   — PreCompact
+  POST /hook/subagent-stop — SubagentStop
+  POST /hook/stop          — Stop          (assistant turn end)
+  POST /hook/session-end   — SessionEnd
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 from typing import Callable
 
 from cia.schema import Event, Phase
 
 _ROUTE_PHASE: dict[str, Phase] = {
-    "/hook/pre":  Phase.TOOL_CALL_START,
-    "/hook/post": Phase.TOOL_CALL_END,
-    "/hook/stop": Phase.SESSION_END,
+    "/hook/session-start": Phase.SESSION_START,
+    "/hook/prompt":        Phase.USER_PROMPT,
+    "/hook/pre":           Phase.TOOL_CALL_START,
+    "/hook/post":          Phase.TOOL_CALL_END,
+    "/hook/notification":  Phase.NOTIFICATION,
+    "/hook/pre-compact":   Phase.CONTEXT_COMPACT,
+    "/hook/subagent-stop": Phase.SUBAGENT_END,
+    "/hook/stop":          Phase.TURN_END,
+    "/hook/session-end":   Phase.SESSION_END,
 }
+
+_DEBUG = os.environ.get("CIA_DEBUG", "").lower() in ("1", "true", "yes", "on")
+
+
+def _dlog(msg: str) -> None:
+    if _DEBUG:
+        print(f"[cia.hooks] {msg}", file=sys.stderr, flush=True)
 
 _OK = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 _BAD = b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -62,6 +83,7 @@ class HookReceiver:
                 payload = json.loads(body)
                 event = Event.from_hook_payload(phase, payload)
                 self._emit(event)
+                _dlog(_describe(phase, payload))
                 writer.write(_OK)
             else:
                 writer.write(_BAD)
@@ -73,6 +95,26 @@ class HookReceiver:
                 writer.close()
             except Exception:
                 pass
+
+
+def _describe(phase: Phase, payload: dict) -> str:
+    """One-line debug summary of an incoming hook."""
+    sid = (payload.get("session_id") or "")[:8]
+    if phase is Phase.USER_PROMPT:
+        prompt = (payload.get("prompt") or "").replace("\n", " ")
+        return f"{phase.value} [{sid}] prompt={prompt[:120]!r}"
+    if phase is Phase.SESSION_START:
+        return f"{phase.value} [{sid}] source={payload.get('source')}"
+    if phase is Phase.SESSION_END:
+        return f"{phase.value} [{sid}] reason={payload.get('reason')}"
+    if phase is Phase.CONTEXT_COMPACT:
+        return f"{phase.value} [{sid}] trigger={payload.get('trigger')}"
+    if phase is Phase.NOTIFICATION:
+        msg = (payload.get("message") or "").replace("\n", " ")
+        return f"{phase.value} [{sid}] {msg[:120]!r}"
+    if phase in (Phase.TOOL_CALL_START, Phase.TOOL_CALL_END):
+        return f"{phase.value} [{sid}] tool={payload.get('tool_name')}"
+    return f"{phase.value} [{sid}]"
 
 
 def _parse_http(raw: bytes) -> tuple[str, bytes | None]:

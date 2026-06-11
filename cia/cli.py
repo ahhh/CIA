@@ -251,7 +251,56 @@ def _print_event(evt: dict) -> None:
     tool = f"  tool={evt['tool']}" if evt.get("tool") else ""
     model = f"  model={evt['model']}" if evt.get("model") else ""
     colour = _phase_colour(phase)
-    console.print(f"[dim]{ts_str}.{ms}[/dim]  [{colour}]{phase:<28}[/{colour}]{dur}{tool}{model}")
+    extra = _event_extra(evt)
+    console.print(
+        f"[dim]{ts_str}.{ms}[/dim]  [{colour}]{phase:<28}[/{colour}]{dur}{tool}{model}{extra}"
+    )
+
+
+def _event_extra(evt: dict) -> str:
+    """Render the rich token / latency fields when present."""
+    parts: list[str] = []
+    ti, to = evt.get("tokens_input"), evt.get("tokens_output")
+    if ti:
+        parts.append(f"in={ti}")
+    if to:
+        parts.append(f"out={to}")
+
+    meta = evt.get("meta") or {}
+    phase = evt.get("phase", "")
+    if phase == "user_prompt" and meta.get("prompt"):
+        prompt = meta["prompt"].replace("\n", " ")
+        parts.append(f"prompt={prompt[:100]!r}")
+    if phase == "session_start" and meta.get("source"):
+        parts.append(f"source={meta['source']}")
+    if phase == "session_end" and meta.get("reason"):
+        parts.append(f"reason={meta['reason']}")
+    if phase == "context_compact" and meta.get("trigger"):
+        parts.append(f"trigger={meta['trigger']}")
+    if phase == "notification" and meta.get("message"):
+        parts.append(f"msg={meta['message'][:80]!r}")
+    tr = meta.get("tool_result") or {}
+    if tr:
+        if tr.get("is_error"):
+            parts.append("ERR")
+        if tr.get("output_bytes") is not None:
+            parts.append(f"{tr['output_bytes']}b")
+    lat = meta.get("latency") or {}
+    if lat.get("ttft_ms") is not None:
+        parts.append(f"ttft={lat['ttft_ms']:.0f}ms")
+    if lat.get("thinking_ms") is not None:
+        parts.append(f"think={lat['thinking_ms']:.0f}ms")
+    if lat.get("output_tokens_per_sec") is not None:
+        parts.append(f"{lat['output_tokens_per_sec']:.0f}tok/s")
+    if meta.get("cache_read_input_tokens"):
+        parts.append(f"cache_r={meta['cache_read_input_tokens']}")
+    usage = meta.get("usage") or {}
+    if usage.get("cache_read_input_tokens"):
+        parts.append(f"cache_r={usage['cache_read_input_tokens']}")
+    if meta.get("stop_reason"):
+        parts.append(f"stop={meta['stop_reason']}")
+
+    return ("  [dim]" + " ".join(parts) + "[/dim]") if parts else ""
 
 
 def _phase_colour(phase: str) -> str:
@@ -264,6 +313,14 @@ def _phase_colour(phase: str) -> str:
     if "tool" in phase:
         return "yellow"
     if "file" in phase:
+        return "blue"
+    if "prompt" in phase:
+        return "green"
+    if "notification" in phase:
+        return "yellow"
+    if "compact" in phase:
+        return "magenta"
+    if "session" in phase or "turn" in phase or "subagent" in phase:
         return "blue"
     return "white"
 

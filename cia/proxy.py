@@ -8,6 +8,8 @@ back to the daemon's main loop via loop.call_soon_threadsafe().
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import threading
 import time
 from typing import Callable, Optional
@@ -20,6 +22,13 @@ from cia.schema import Event, Phase
 from cia.sse_parser import SSEParser
 
 _ANTHROPIC_HOST = "api.anthropic.com"
+_DEBUG = os.environ.get("CIA_DEBUG", "").lower() in ("1", "true", "yes", "on")
+
+
+def _dlog(msg: str) -> None:
+    """Print a debug line to the daemon log when CIA_DEBUG is set."""
+    if _DEBUG:
+        print(f"[cia.proxy] {msg}", file=sys.stderr, flush=True)
 
 
 def _is_anthropic(flow: http.HTTPFlow) -> bool:
@@ -46,11 +55,15 @@ class CIAAddon:
         if not _is_anthropic(flow):
             return
         self._req_ts[flow.id] = time.time()
+        _dlog(f"→ {flow.request.method} {flow.request.path}  (flow {flow.id[:8]})")
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
         if not _is_anthropic(flow):
             return
-        if _is_sse(flow):
+        ctype = flow.response.headers.get("content-type", "?")
+        sse = _is_sse(flow)
+        _dlog(f"← {flow.response.status_code} {ctype}  sse={sse}  (flow {flow.id[:8]})")
+        if sse:
             parser = SSEParser(flow.id, self._emit)
             parser.set_request_start(self._req_ts.get(flow.id, time.time()))
             self._parsers[flow.id] = parser
@@ -61,16 +74,25 @@ class CIAAddon:
         if not _is_anthropic(flow):
             return
         if flow.response.status_code >= 400 and not _is_sse(flow):
+            # Capture the error body (helpful for diagnosing 400/404s).
+            body = ""
+            try:
+                body = flow.response.get_text(strict=False) or ""
+            except Exception:
+                pass
+            _dlog(f"✗ HTTP {flow.response.status_code} {flow.request.path}: {body[:300]}")
             self._emit(Event(
                 phase=Phase.API_REQUEST_ERROR,
                 ts=self._req_ts.get(flow.id, time.time()),
                 error=f"HTTP {flow.response.status_code}",
-                meta={"flow_id": flow.id},
+                meta={"flow_id": flow.id, "path": flow.request.path,
+                      "body": body[:500]},
             ))
         # Flush any remaining buffer and clean up
         parser = self._parsers.pop(flow.id, None)
         if parser:
             parser.flush()
+            _dlog(f"⇲ stream complete (flow {flow.id[:8]})")
         self._req_ts.pop(flow.id, None)
 
 
@@ -105,15 +127,24 @@ class ProxyThread(threading.Thread):
         self._error: Optional[Exception] = None
 
     def run(self) -> None:
+        # mitmproxy's DumpMaster.__init__ calls asyncio.get_running_loop(),
+        # and Master.run() is a coroutine, so this thread needs its own loop.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            opts = Options(listen_host=self._host, listen_port=self._port)
-            self._master = DumpMaster(opts, with_termlog=False, with_dumper=False)
-            self._master.addons.add(CIAAddon(self._emit))
-            self._started.set()
-            self._master.run()
+            loop.run_until_complete(self._serve())
         except Exception as exc:
             self._error = exc
             self._started.set()
+        finally:
+            loop.close()
+
+    async def _serve(self) -> None:
+        opts = Options(listen_host=self._host, listen_port=self._port)
+        self._master = DumpMaster(opts, with_termlog=False, with_dumper=False)
+        self._master.addons.add(CIAAddon(self._emit))
+        self._started.set()
+        await self._master.run()
 
     def wait_ready(self, timeout: float = 5.0) -> None:
         self._started.wait(timeout)

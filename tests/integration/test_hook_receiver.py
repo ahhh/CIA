@@ -114,7 +114,31 @@ class TestHookEndpoints:
         status = await _post(port, "/hook/stop", payload)
         assert status == 200
         await asyncio.sleep(0.05)
+        # Stop fires at the end of each assistant turn, not session end.
+        assert events[0].phase is Phase.TURN_END
+
+    async def test_session_end_hook(self, receiver_and_events):
+        port, events = receiver_and_events
+        payload = {"session_id": "ses_003b", "reason": "exit",
+                   "hook_event_name": "SessionEnd"}
+        status = await _post(port, "/hook/session-end", payload)
+        assert status == 200
+        await asyncio.sleep(0.05)
         assert events[0].phase is Phase.SESSION_END
+        assert events[0].meta.get("reason") == "exit"
+
+    async def test_new_lifecycle_hooks(self, receiver_and_events):
+        port, events = receiver_and_events
+        for path, name, phase in [
+            ("/hook/notification",  "Notification", Phase.NOTIFICATION),
+            ("/hook/pre-compact",   "PreCompact",   Phase.CONTEXT_COMPACT),
+            ("/hook/subagent-stop", "SubagentStop", Phase.SUBAGENT_END),
+        ]:
+            status = await _post(port, path, {"session_id": "s", "hook_event_name": name})
+            assert status == 200
+        await asyncio.sleep(0.05)
+        phases = {e.phase for e in events}
+        assert {Phase.NOTIFICATION, Phase.CONTEXT_COMPACT, Phase.SUBAGENT_END} <= phases
 
     async def test_unknown_path_returns_400(self, receiver_and_events):
         port, events = receiver_and_events

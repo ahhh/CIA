@@ -26,9 +26,15 @@ curl -s -f --connect-timeout 0.5 --max-time 2 \\
 
 # Maps Claude Code hook event name → (script filename, URL endpoint)
 _HOOK_MAP: dict[str, tuple[str, str]] = {
-    "PreToolUse": ("cia_pre_tool.sh",  "pre"),
-    "PostToolUse": ("cia_post_tool.sh", "post"),
-    "Stop":       ("cia_stop.sh",      "stop"),
+    "SessionStart":     ("cia_session_start.sh",  "session-start"),
+    "UserPromptSubmit": ("cia_user_prompt.sh",    "prompt"),
+    "PreToolUse":       ("cia_pre_tool.sh",        "pre"),
+    "PostToolUse":      ("cia_post_tool.sh",       "post"),
+    "Notification":     ("cia_notification.sh",    "notification"),
+    "PreCompact":       ("cia_pre_compact.sh",     "pre-compact"),
+    "SubagentStop":     ("cia_subagent_stop.sh",   "subagent-stop"),
+    "Stop":             ("cia_stop.sh",            "stop"),
+    "SessionEnd":       ("cia_session_end.sh",     "session-end"),
 }
 
 

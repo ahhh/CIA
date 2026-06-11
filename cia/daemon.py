@@ -71,6 +71,16 @@ class Daemon:
                 port=self._proxy_port,
             )
             self._proxy_thread.start()
+            try:
+                self._proxy_thread.wait_ready()
+            except Exception as exc:
+                # Surface proxy startup failures loudly instead of silently
+                # running without HTTPS interception (and without a CA cert).
+                print(
+                    f"[cia] WARNING: proxy failed to start on "
+                    f"{self._proxy_host}:{self._proxy_port}: {exc!r}",
+                    flush=True,
+                )
 
         hook_receiver = HookReceiver(self._emit, self._hook_host, self._hook_port)
         socket_server = SocketServer(self._socket_path, self)
