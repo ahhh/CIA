@@ -114,6 +114,15 @@ class CIAAddon:
 
     def request(self, flow: http.HTTPFlow) -> None:
         now = time.time()
+        # The SSE timing breakdown is parsed from the *streamed* response body.
+        # mitmproxy hands a streaming transformer the raw, still-encoded bytes
+        # (it only auto-decodes fully-buffered responses), and Anthropic sends
+        # /v1/messages SSE gzip-compressed — so a compressed stream reaches the
+        # parser as gzip and never yields `data:` lines. Drop Accept-Encoding on
+        # Anthropic requests so the stream comes back as plaintext SSE; the small
+        # bandwidth cost on the non-streamed JSON calls is immaterial here.
+        if _is_anthropic(flow):
+            flow.request.headers.pop("accept-encoding", None)
         # Flows that never see a response (dropped connections) would leak
         # their req_info entry; evict the oldest past a sane bound.
         while len(self._req_info) > 512:
