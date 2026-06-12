@@ -55,6 +55,13 @@ See [docs/event-schema.md](docs/event-schema.md) for the full field reference.
 | Human latency | Time spent waiting on permission prompts and user input vs Claude actually working |
 | Compaction cost | Context tokens reclaimed by each compaction |
 | Rework | Files edited repeatedly in a single turn (thrash signal) |
+| Cache economics | Prompt-cache hit rate, warm vs cold TTFB (what cache warmth is worth in latency), and bust forensics — each cache rebuild attributed to a compaction, a 5-minute TTL expiry (with the idle gap that caused it), or a prompt change, plus the retokenized input it cost |
+| Thinking calibration | Adaptive-thinking fire rate (requested vs fired), budget utilization, thinking→tool decisiveness percentiles per model, and turns above vs below median thinking compared on downstream tool errors / re-edits |
+| Context pressure | Context growth per turn, which tools feed the context fastest, and projected turns until the next compaction |
+| Tool chains | Tool→tool transition patterns, retry loops (same tool + same target back to back), search thrash (Grep/Glob churn before the first Read), and time/calls to recover after tool errors |
+| Cost attribution | Claude Code's native cost/token/LoC telemetry joined onto turns: cost per turn, cost of rework turns, cost per commit and per line added |
+| Throughput | tok/s and TTFB/TTFT percentiles per model, hour-of-day variance, slowest requests, and in-response speed sag computed from `api_progress` ticks |
+| Network overhead | Non-inference traffic share by category (Statsig, Sentry, update checks…), failure rates, and whether failures landed while an inference call was in flight |
 
 `api_request_start` events also carry the request anatomy (system prompt size, message count, tool definition size, thinking type/budget, effort) in `meta.request`.
 

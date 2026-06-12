@@ -519,9 +519,16 @@ def report(session, since, input_file, as_json):
     _render_sessions(data["sessions"])
     _render_turns(data["turns"])
     _render_tools(data["tools"])
+    _render_chains(data["chains"])
     _render_human(data["human"])
     _render_compactions(data["compactions"])
     _render_rework(data["rework"])
+    _render_cache(data["cache"])
+    _render_thinking(data["thinking"])
+    _render_context(data["context"])
+    _render_cost(data["cost"])
+    _render_throughput(data["throughput"])
+    _render_network(data["network"])
 
 
 def _load_events(input_file, since):
@@ -678,6 +685,255 @@ def _render_rework(files: list) -> None:
             "[red]YES[/red]" if f["flagged"] else "",
         )
     console.print(t)
+
+
+def _render_chains(chains: dict) -> None:
+    st = chains["search_thrash"]
+    er = chains["error_recovery"]
+    if not chains["transitions"]:
+        return
+    console.print("[bold cyan]Tool chains[/bold cyan]")
+    top = ", ".join(f"{t['from']}→{t['to']} ×{t['count']}"
+                    for t in chains["transitions"][:5])
+    console.print(f"  transitions: [dim]{escape(top)}[/dim]")
+    if st["searches"] or st["reads"]:
+        ratio = (f"{st['search_to_read_ratio']:.1f}"
+                 if st["search_to_read_ratio"] is not None else "-")
+        console.print(
+            f"  search thrash: {st['searches']} searches / {st['reads']} reads "
+            f"(ratio {ratio}), {len(st['thrash_turns'])} turn(s) with 3+ "
+            f"searches before the first Read")
+    if er["errors"]:
+        line = f"  error recovery: {er['recovered']}/{er['errors']} recovered"
+        if er["recovery_calls_p50"] is not None:
+            line += (f", p50 {er['recovery_calls_p50']:.0f} call(s) / "
+                     f"{er['recovery_ms_p50']/1000:.1f}s to next success")
+        if er["unrecovered"]:
+            line += f", [red]{er['unrecovered']} never recovered[/red]"
+        console.print(line)
+    if chains["retry_loops"]:
+        t = Table(title="Retry loops — same tool, same target, back to back",
+                  show_header=True, header_style="bold cyan")
+        for col in ("time", "tool", "target", "repeats", "errors"):
+            t.add_column(col, justify="right" if col in ("repeats", "errors") else "left")
+        for loop in chains["retry_loops"][:10]:
+            t.add_row(
+                time.strftime("%H:%M:%S", time.localtime(loop["first_ts"])),
+                loop["tool"], (loop["target"] or "")[:50],
+                str(loop["repeats"]), str(loop["errors"]),
+            )
+        console.print(t)
+
+
+def _render_cache(cache: dict) -> None:
+    if not cache["requests"]:
+        return
+    tok = cache["tokens"]
+    warm, cold = cache["ttfb_ms"]["warm"], cache["ttfb_ms"]["cold"]
+    t = Table(title="Cache economics", show_header=True, header_style="bold cyan")
+    for col in ("requests", "warm", "hit rate", "read ratio",
+                "ttfb warm p50", "ttfb cold p50", "ttl expiries", "retokenized"):
+        t.add_column(col, justify="right")
+    t.add_row(
+        str(cache["requests"]), str(cache["warm_requests"]),
+        f"{cache['hit_rate']*100:.0f}%" if cache["hit_rate"] is not None else "-",
+        f"{tok['read_ratio']*100:.0f}%" if tok["read_ratio"] is not None else "-",
+        f"{warm['p50']:.0f}ms" if warm["p50"] is not None else "-",
+        f"{cold['p50']:.0f}ms" if cold["p50"] is not None else "-",
+        str(cache["ttl"]["expiries"]),
+        f"{cache['ttl']['retokenized_tokens']:,}" if cache["ttl"]["retokenized_tokens"] else "-",
+    )
+    console.print(t)
+    if cache["busts"]:
+        bt = Table(title="Cache busts — prompt-cache prefix rebuilt",
+                   show_header=True, header_style="bold cyan")
+        for col in ("time", "cause", "idle s", "cached before",
+                    "read at bust", "retokenized"):
+            bt.add_column(col, justify="right" if col != "cause" else "left")
+        for b in cache["busts"]:
+            bt.add_row(
+                time.strftime("%H:%M:%S", time.localtime(b["ts"])),
+                b["cause"], f"{b['idle_s']:.0f}",
+                f"{b['cached_before']:,}", f"{b['cache_read']:,}",
+                f"{b['retokenized_tokens']:,}",
+            )
+        console.print(bt)
+    console.print("[dim]warm = cache covered ≥50% of context; read ratio = "
+                  "cache-read tokens / total context tokens; ttl = idle gap "
+                  "exceeded the 5-minute prompt-cache window[/dim]")
+
+
+def _render_thinking(th: dict) -> None:
+    if not th["responses"] and not th["decisiveness_ms"]:
+        return
+    console.print("[bold cyan]Thinking calibration[/bold cyan]")
+    if th["thinking_requested"]:
+        fr = f"{th['fire_rate']*100:.0f}%" if th["fire_rate"] is not None else "-"
+        console.print(f"  adaptive thinking: requested on "
+                      f"{th['thinking_requested']} requests, fired on "
+                      f"{th['thinking_fired']} ({fr})")
+    b = th["budget"]
+    if b["samples"]:
+        console.print(f"  budget utilization: p50 {b['utilization_p50']*100:.0f}%, "
+                      f"max {b['utilization_max']*100:.0f}% "
+                      f"({b['interrupted']} thinking block(s) interrupted)")
+    for model, d in th["decisiveness_ms"].items():
+        console.print(f"  decisiveness {model}: p50 {d['p50']:.0f}ms, "
+                      f"p90 {d['p90']:.0f}ms thinking→tool ({d['count']} gaps)")
+    if len(th["by_effort"]) > 1:
+        t = Table(title="Thinking by requested effort",
+                  show_header=True, header_style="bold cyan")
+        for col in ("effort", "requests", "fired", "fire rate", "mean think s"):
+            t.add_column(col, justify="right" if col != "effort" else "left")
+        for k, g in sorted(th["by_effort"].items()):
+            t.add_row(
+                k, str(g["requests"]), str(g["fired"]),
+                f"{g['fire_rate']*100:.0f}%",
+                f"{g['mean_thinking_ms']/1000:.1f}" if g["mean_thinking_ms"] else "-",
+            )
+        console.print(t)
+    split = th["turn_split"]
+    if split and split["high_thinking"]["turns"] and split["low_thinking"]["turns"]:
+        hi, lo = split["high_thinking"], split["low_thinking"]
+        console.print(
+            f"  turns above median thinking ({split['median_thinking_ms']/1000:.1f}s): "
+            f"{hi['mean_tool_errors']:.2f} tool errors / "
+            f"{hi['mean_repeat_edit_files']:.2f} re-edited files per turn, "
+            f"vs {lo['mean_tool_errors']:.2f} / {lo['mean_repeat_edit_files']:.2f} below")
+
+
+def _render_context(cp: dict) -> None:
+    rows = [r for r in cp["turns"] if r["context_tokens"] is not None]
+    if not rows:
+        return
+    t = Table(title="Context pressure — growth per turn",
+              show_header=True, header_style="bold cyan")
+    for col in ("start", "context", "Δ tokens", "tool out", "top tool", "compacted"):
+        t.add_column(col, justify="right" if col not in ("start", "top tool") else "left")
+    for r in rows:
+        t.add_row(
+            time.strftime("%H:%M:%S", time.localtime(r["start_ts"])),
+            f"{r['context_tokens']:,}",
+            f"{r['context_delta']:+,}" if r["context_delta"] is not None else "-",
+            f"{r['tool_output_bytes']/1024:.0f}K" if r["tool_output_bytes"] else "-",
+            r["top_tool"] or "-",
+            "yes" if r["compacted"] else "",
+        )
+    console.print(t)
+    bits = []
+    if cp["growth_per_turn_p50"]:
+        bits.append(f"median growth {cp['growth_per_turn_p50']:,.0f} tok/turn")
+    if cp["projected_turns_to_compaction"]:
+        proj = ", ".join(f"{(sid or '?')[:8]}: ~{n:g} turns"
+                         for sid, n in cp["projected_turns_to_compaction"].items())
+        bits.append(f"projected to compaction ({cp['compaction_threshold']:,} tok): {proj}")
+    if cp["bloat_by_tool"]:
+        top = cp["bloat_by_tool"][0]
+        bits.append(f"biggest context feeder: {top['tool']} "
+                    f"({top['output_bytes']/1024:.0f}K of tool output)")
+    if bits:
+        console.print(f"[dim]{escape('; '.join(bits))}[/dim]")
+
+
+def _render_cost(cost: dict) -> None:
+    if not cost.get("available"):
+        return
+
+    def usd(v) -> str:
+        return f"${v:.4f}" if v is not None else "-"
+
+    t = Table(title="Cost attribution (native telemetry)",
+              show_header=True, header_style="bold cyan")
+    for col in ("total", "rework", "per commit", "per line added", "unattributed"):
+        t.add_column(col, justify="right")
+    t.add_row(usd(cost["total_cost_usd"]), usd(cost["rework_cost_usd"]),
+              usd(cost["cost_per_commit_usd"]),
+              usd(cost["cost_per_line_added_usd"]), usd(cost["unattributed_usd"]))
+    console.print(t)
+
+    turns = [r for r in cost["turns"] if r["cost_usd"]]
+    if turns:
+        tt = Table(title="Cost per turn", show_header=True, header_style="bold cyan")
+        for col in ("start", "cost", "rework"):
+            tt.add_column(col, justify="right" if col == "cost" else "left")
+        tt.add_column("prompt", no_wrap=True, overflow="ellipsis", max_width=40)
+        for r in turns:
+            tt.add_row(
+                time.strftime("%H:%M:%S", time.localtime(r["start_ts"])),
+                f"${r['cost_usd']:.4f}",
+                "[red]yes[/red]" if r["rework"] else "",
+                r["prompt"],
+            )
+        console.print(tt)
+    console.print("[dim]costs from Claude Code's own telemetry, attributed to "
+                  "the most recent turn started before each metric export "
+                  "(~10s granularity)[/dim]")
+
+
+def _render_throughput(tp: dict) -> None:
+    if not tp["requests"]:
+        return
+    t = Table(title="Throughput by model", show_header=True, header_style="bold cyan")
+    for col in ("model", "req", "tok/s p50", "tok/s p90",
+                "ttfb p50", "ttfb p90", "ttft p50"):
+        t.add_column(col, justify="right" if col != "model" else "left")
+
+    def fmt(d: dict, key: str, suffix: str = "") -> str:
+        return f"{d[key]:.0f}{suffix}" if d[key] is not None else "-"
+
+    for m, s in tp["by_model"].items():
+        t.add_row(
+            m, str(s["requests"]),
+            fmt(s["tok_per_sec"], "p50"), fmt(s["tok_per_sec"], "p90"),
+            fmt(s["ttfb_ms"], "p50", "ms"), fmt(s["ttfb_ms"], "p90", "ms"),
+            fmt(s["ttft_ms"], "p50", "ms"),
+        )
+    console.print(t)
+    sag = tp["sag"]
+    if sag and sag["late_to_early_ratio"] is not None:
+        console.print(f"[dim]in-response speed: {sag['early_tok_per_sec']:.0f} tok/s "
+                      f"early → {sag['late_tok_per_sec']:.0f} tok/s late "
+                      f"({sag['late_to_early_ratio']*100:.0f}% of early pace, "
+                      f"{sag['flows']} long response(s))[/dim]")
+    if len(tp["by_hour"]) > 1:
+        hours = "  ".join(f"{h:02d}h:{s['tok_per_sec_p50']:.0f}"
+                          for h, s in tp["by_hour"].items())
+        console.print(f"[dim]tok/s p50 by hour: {hours}[/dim]")
+    slow = tp["slow_requests"]
+    if slow:
+        worst = slow[0]
+        console.print(f"[dim]slowest TTFB: {worst['ttfb_ms']:.0f}ms at "
+                      f"{time.strftime('%H:%M:%S', time.localtime(worst['ts']))} "
+                      f"({worst['model']})[/dim]")
+
+
+def _render_network(net: dict) -> None:
+    if not net["by_category"]:
+        return
+    t = Table(title="Network overhead — non-inference traffic",
+              show_header=True, header_style="bold cyan")
+    for col in ("category", "req", "err", "total ms", "KB", "top hosts"):
+        t.add_column(col, justify="right" if col not in ("category", "top hosts") else "left")
+    for c in net["by_category"]:
+        t.add_row(
+            c["category"], str(c["requests"]),
+            str(c["errors"]) if c["errors"] else "-",
+            f"{c['total_ms']:.0f}",
+            f"{c['total_bytes']/1024:.1f}",
+            ", ".join(c["top_hosts"]),
+        )
+    console.print(t)
+    tot = net["totals"]
+    if tot["overhead_time_frac"] is not None:
+        console.print(f"[dim]overhead: {tot['overhead_ms']/1000:.1f}s across "
+                      f"{tot['overhead_requests']} request(s) = "
+                      f"{tot['overhead_time_frac']*100:.1f}% of network time "
+                      f"(inference {tot['inference_ms']/1000:.1f}s)[/dim]")
+    for fail in net["failures"][:10]:
+        during = " [red]during API call[/red]" if fail["during_api_call"] else ""
+        console.print(f"  [red]{fail['status'] or 'ERR'}[/red] "
+                      f"{escape(fail['host'] + _strip_query(fail['path'] or ''))} "
+                      f"[dim][{fail['category']}][/dim]{during}")
 
 
 # ------------------------------------------------------------------ #
