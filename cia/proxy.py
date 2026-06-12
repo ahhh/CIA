@@ -19,6 +19,7 @@ from mitmproxy import http
 from mitmproxy.options import Options
 from mitmproxy.tools.dump import DumpMaster
 
+from cia.endpoints import classify_endpoint, is_inference_traffic
 from cia.schema import Event, Phase
 from cia.sse_parser import SSEParser
 
@@ -56,6 +57,14 @@ def _parse_json_body(message) -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _error_body(flow: http.HTTPFlow) -> str:
+    """Response body text of a failed request; '' on decode failure."""
+    try:
+        return flow.response.get_text(strict=False) or ""
+    except Exception:
+        return ""
 
 
 def _request_anatomy(body: dict, body_chars: int) -> dict:
@@ -104,25 +113,36 @@ class CIAAddon:
         self._req_info: dict[str, dict] = {}
 
     def request(self, flow: http.HTTPFlow) -> None:
-        if not _is_anthropic(flow):
-            return
         now = time.time()
+        # Flows that never see a response (dropped connections) would leak
+        # their req_info entry; evict the oldest past a sane bound.
+        while len(self._req_info) > 512:
+            self._req_info.pop(next(iter(self._req_info)))
         endpoint = _endpoint(flow)
+        host = flow.request.pretty_host
+        kind = classify_endpoint(host, endpoint)
         body_chars = 0
         try:
             body_chars = len(flow.request.get_text(strict=False) or "")
         except Exception:
             pass
-        body = _parse_json_body(flow.request)
+        body = _parse_json_body(flow.request) if _is_anthropic(flow) else {}
         self._req_info[flow.id] = {
             "ts": now,
             "endpoint": endpoint,
+            "host": host,
+            "method": flow.request.method,
+            "request_bytes": body_chars,
+            "category": kind["category"],
+            "purpose": kind["purpose"],
             "model": body.get("model"),
-            "anatomy": _request_anatomy(body, body_chars) if endpoint == _MESSAGES_PATH else None,
+            "anatomy": _request_anatomy(body, body_chars)
+                       if _is_anthropic(flow) and endpoint == _MESSAGES_PATH else None,
         }
-        _dlog(f"→ {flow.request.method} {flow.request.path}  (flow {flow.id[:8]})")
+        _dlog(f"→ {flow.request.method} {host}{flow.request.path} "
+              f"[{kind['category']}]  (flow {flow.id[:8]})")
 
-        if endpoint == _COUNT_TOKENS_PATH:
+        if _is_anthropic(flow) and endpoint == _COUNT_TOKENS_PATH:
             self._emit(Event(
                 phase=Phase.TOKENIZER_START,
                 ts=now,
@@ -146,34 +166,78 @@ class CIAAddon:
             flow.response.stream = _make_stream_transformer(parser)
 
     def response(self, flow: http.HTTPFlow) -> None:
-        if not _is_anthropic(flow):
-            return
         info = self._req_info.pop(flow.id, {})
         req_ts = info.get("ts")
         parser = self._parsers.pop(flow.id, None)
+        if "category" not in info:
+            # request() wasn't seen for this flow (e.g. proxy attached
+            # mid-connection); classify from the response side.
+            info.update(classify_endpoint(flow.request.pretty_host,
+                                          _endpoint(flow)))
+        inference = _is_anthropic(flow) and is_inference_traffic(info["category"])
 
-        if flow.response.status_code >= 400 and not _is_sse(flow):
-            # Capture the error body (helpful for diagnosing 400/404s).
-            body = ""
-            try:
-                body = flow.response.get_text(strict=False) or ""
-            except Exception:
-                pass
-            _dlog(f"✗ HTTP {flow.response.status_code} {flow.request.path}: {body[:300]}")
-            self._emit(Event(
-                phase=Phase.API_REQUEST_ERROR,
-                ts=req_ts or time.time(),
-                error=f"HTTP {flow.response.status_code}",
-                meta={"flow_id": flow.id, "path": flow.request.path,
-                      "body": body[:500]},
-            ))
-        elif parser is not None:
+        if parser is not None:
             # Streaming flow: flush any remaining buffer; the SSE parser
             # has already emitted the full API timing breakdown.
             parser.flush()
             _dlog(f"⇲ stream complete (flow {flow.id[:8]})")
-        else:
-            self._on_json_response(flow, info, req_ts)
+            return
+
+        if inference:
+            if flow.response.status_code >= 400 and not _is_sse(flow):
+                body = _error_body(flow)
+                _dlog(f"✗ HTTP {flow.response.status_code} {flow.request.path}: {body[:300]}")
+                self._emit(Event(
+                    phase=Phase.API_REQUEST_ERROR,
+                    ts=req_ts or time.time(),
+                    error=f"HTTP {flow.response.status_code}",
+                    model=info.get("model"),
+                    meta={"flow_id": flow.id, "path": flow.request.path,
+                          "category": info["category"],
+                          "purpose": info["purpose"],
+                          "body": body[:500]},
+                ))
+            else:
+                self._on_json_response(flow, info, req_ts)
+            return
+
+        # Everything else — boot check-ins, telemetry, feature flags,
+        # crash reports, update checks — becomes a network_request event.
+        self._emit_network_request(flow, info, req_ts)
+
+    def _emit_network_request(self, flow: http.HTTPFlow, info: dict,
+                              req_ts: Optional[float]) -> None:
+        now = time.time()
+        status = flow.response.status_code
+        duration_ms = (now - req_ts) * 1000 if req_ts is not None else None
+        try:
+            response_bytes = len(flow.response.raw_content or b"")
+        except Exception:
+            response_bytes = None
+        meta = {
+            "flow_id": flow.id,
+            "method": info.get("method") or flow.request.method,
+            "host": info.get("host") or flow.request.pretty_host,
+            "path": flow.request.path,
+            "status": status,
+            "category": info["category"],
+            "purpose": info["purpose"],
+            "request_bytes": info.get("request_bytes"),
+            "response_bytes": response_bytes,
+        }
+        error = None
+        if status >= 400:
+            error = f"HTTP {status}"
+            meta["body"] = _error_body(flow)[:500]
+        _dlog(f"⇄ {meta['method']} {meta['host']}{meta['path']} "
+              f"{status} [{info['category']}] (flow {flow.id[:8]})")
+        self._emit(Event(
+            phase=Phase.NETWORK_REQUEST,
+            ts=req_ts or now,
+            duration_ms=duration_ms,
+            error=error,
+            meta=meta,
+        ))
 
     def _on_json_response(self, flow: http.HTTPFlow, info: dict,
                           req_ts: Optional[float]) -> None:

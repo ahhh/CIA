@@ -92,6 +92,25 @@ Claude Code counts tokens server-side via `POST /v1/messages/count_tokens`; CIA 
 | `tokenizer_start` | count_tokens request leaves the client | `model` |
 | `tokenizer_end` | count_tokens response received | `model`, `tokens_input` (the counted tokens), `duration_ms` |
 
+### Network check-ins (`network_request`)
+
+Every HTTP flow through the proxy that is *not* an inference or tokenizer
+call — boot check-ins, telemetry, feature flags, crash reports, update
+checks — is emitted as a single `network_request` event when the response
+completes, tagged with why Claude Code made the request (catalog in
+`cia/endpoints.py`).
+
+| Phase | Emitted when | Key fields set |
+|---|---|---|
+| `network_request` | Non-inference HTTP response completes (any host) | `duration_ms`, `error` (`HTTP <status>` when ≥ 400), `meta.method`, `meta.host`, `meta.path`, `meta.status`, `meta.category`, `meta.purpose`, `meta.request_bytes`, `meta.response_bytes`, `meta.body` (error body snippet, on errors) |
+
+`meta.category` values: `health` (boot connectivity probe `/api/hello`),
+`config` (managed settings `/api/claude_code/settings`), `account`
+(`/api/claude_cli_profile`, OAuth profile/roles/usage), `auth` (token
+refresh), `feature_flags` (Statsig initialize), `telemetry` (Statsig
+event logging), `error_reporting` (Sentry), `update` (npm registry / GCS
+downloads), `api_other` (unrecognized Anthropic API path), `unknown`.
+
 ### Tool calls
 
 | Phase | Emitted when | Key fields set |
@@ -106,7 +125,19 @@ Note: `tool_call_end` events may also set `error` when the tool returned a non-f
 
 | Phase | Emitted when | Key fields set |
 |---|---|---|
-| `file_change` | `fswatch` reports a create/update/delete/rename | `meta.path`, `meta.watch_dir` |
+| `file_change` | `fswatch` reports a create/update/delete/rename | `meta.path`, `meta.watch_dir`; for Claude-data paths also `meta.category`, `meta.filename`, `meta.change` |
+
+For paths classified as Claude's own data (transcripts, memory, todos,
+settings), `meta.change` describes *what* changed:
+
+| `change.kind` | Meaning | Extra fields |
+|---|---|---|
+| `append` | Bytes appended to a `.jsonl` file | `bytes_delta`, `records` (parsed previews: `type`, `role`, first 150 chars of content / `[tool_use: X]` markers; max 5 + a `{more: N}` marker), `clipped` when only the last 16 KB of the delta was read |
+| `created` | File first seen after watcher start | `records` (jsonl) or `snippet` (first 600 chars) |
+| `diff` | Small text file content changed | `bytes_delta`, `snippet` (unified diff, ≤ 12 lines / 600 chars) |
+| `rewrite` | A `.jsonl` file shrank (rewritten in place) | `bytes_delta`, `records` from the new tail |
+| `modified` | File too large (> 256 KB) to diff | `bytes_delta` |
+| `removed` | A previously-seen file was deleted | — |
 
 ### Claude Code native telemetry (OTLP receiver)
 

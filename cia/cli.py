@@ -23,6 +23,7 @@ from pathlib import Path
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 CIA_DIR = Path.home() / ".cia"
@@ -321,7 +322,7 @@ def _print_event(evt: dict) -> None:
     dur = f"  [{evt['duration_ms']:.0f}ms]" if evt.get("duration_ms") is not None else ""
     tool = f"  tool={evt['tool']}" if evt.get("tool") else ""
     model = f"  model={evt['model']}" if evt.get("model") else ""
-    colour = _phase_colour(phase)
+    colour = "red" if evt.get("error") else _phase_colour(phase)
     extra = _event_extra(evt)
     console.print(
         f"[dim]{ts_str}.{ms}[/dim]  [{colour}]{phase:<28}[/{colour}]{dur}{tool}{model}{extra}"
@@ -359,11 +360,21 @@ def _event_extra(evt: dict) -> str:
             parts.append(f"/{meta['pattern']}/")
         elif meta.get("target"):
             parts.append(str(meta["target"])[:60])
+    if phase == "network_request":
+        parts.append(f"{meta.get('method', '?')} "
+                     f"{meta.get('host', '?')}{_strip_query(meta.get('path', ''))}")
+        if meta.get("status") is not None:
+            parts.append(str(meta["status"]))
+        if meta.get("category"):
+            parts.append(f"[{meta['category']}]")
+        if meta.get("purpose"):
+            parts.append(f"— {meta['purpose']}")
     if phase == "file_change":
         if meta.get("category"):
             parts.append(f"[{meta['category']}]")
         fp = meta.get("path", "")
         parts.append(fp if len(fp) <= 80 else "…" + fp[-79:])
+        parts.extend(_change_summary(meta.get("change") or {}))
     if phase == "api_progress":
         parts.append(f"{meta.get('state')} ~{meta.get('est_output_tokens')}tok")
     if phase == "otel_metric":
@@ -419,7 +430,33 @@ def _event_extra(evt: dict) -> str:
     if meta.get("stop_reason"):
         parts.append(f"stop={meta['stop_reason']}")
 
-    return ("  [dim]" + " ".join(parts) + "[/dim]") if parts else ""
+    # escape: parts are data and may contain [...] that Rich would eat as markup
+    return ("  [dim]" + escape(" ".join(parts)) + "[/dim]") if parts else ""
+
+
+def _strip_query(path: str) -> str:
+    return path.split("?", 1)[0]
+
+
+def _change_summary(change: dict) -> list[str]:
+    """One-line rendering of a file_change content delta."""
+    if not change:
+        return []
+    parts = [f"({change['kind']})"]
+    if change.get("bytes_delta"):
+        delta = change["bytes_delta"]
+        parts.append(f"{'+' if delta > 0 else ''}{delta}b")
+    for rec in (change.get("records") or [])[:3]:
+        if rec.get("more"):
+            parts.append(f"…+{rec['more']} more")
+            continue
+        label = "/".join(dict.fromkeys(filter(None, (rec.get("type"), rec.get("role")))))
+        text = (rec.get("preview") or "").replace("\n", " ")[:60]
+        parts.append(f"<{label}> {text!r}" if text else f"<{label}>")
+    if change.get("snippet") and not change.get("records"):
+        snippet = change["snippet"].replace("\n", " ⏎ ")
+        parts.append(snippet[:120])
+    return parts
 
 
 def _phase_colour(phase: str) -> str:
@@ -429,6 +466,8 @@ def _phase_colour(phase: str) -> str:
         return "dim cyan"
     if "otel" in phase:
         return "bright_green"
+    if "network" in phase:
+        return "bright_blue"
     if "thinking" in phase:
         return "magenta"
     if "tokenizer" in phase:

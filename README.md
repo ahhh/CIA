@@ -8,6 +8,7 @@ External, passive monitor for Claude Code sessions. Observes API call latency, t
 |---|---|
 | Anthropic API request + response timing (streaming and non-streaming) | mitmproxy intercepts HTTPS |
 | Tokenizer runs (`count_tokens` calls): when + duration + counted tokens | mitmproxy intercepts HTTPS |
+| Every other network check-in Claude Code makes — boot connectivity probe, managed-settings fetch, account/profile sync, Statsig feature flags & telemetry, Sentry crash reports, update checks — each tagged with a category and *why* the request happened (`network_request`) | mitmproxy intercepts HTTPS (all hosts) |
 | Latency breakdown (TTFB, time-to-first-token, generation, tokens/sec) | SSE stream parsing |
 | Model thinking phase start/end (+ estimated thinking tokens & share of output) | SSE stream parsing |
 | Text generation start/end + cache token usage | SSE stream parsing |
@@ -21,7 +22,7 @@ External, passive monitor for Claude Code sessions. Observes API call latency, t
 | In-flight stream progress (elapsed · ~tokens · thinking/responding — the spinner's data) | SSE stream parsing (`api_progress` every 5s) |
 | Claude Code native telemetry: cost, token usage, lines of code, commits (`otel_metric` / `otel_event`) | Built-in OTLP receiver on :4318 |
 | File I/O in watched dirs | `fswatch` subprocess |
-| Claude's own memory / session / transcript writes (categorised `file_change` events) | `fswatch` on `~/.claude/projects/<project>/` + `tasks` (on by default; `--no-watch-claude` to disable) |
+| Claude's own memory / session / transcript writes (categorised `file_change` events), with content deltas: appended transcript records parsed into previews, memory/settings edits as capped unified diffs (`meta.change`) | `fswatch` on `~/.claude/projects/<project>/` + `tasks` (on by default; `--no-watch-claude` to disable) |
 
 ## Output format
 

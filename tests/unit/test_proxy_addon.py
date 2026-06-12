@@ -90,10 +90,52 @@ def test_query_string_is_ignored_when_matching_endpoint():
     assert [e.phase for e in events] == [Phase.TOKENIZER_START, Phase.TOKENIZER_END]
 
 
-def test_non_anthropic_host_is_ignored():
-    flow = _make_flow("/v1/messages", req_body={"model": "m"},
-                      resp_body={}, host="example.com")
-    assert _run(flow) == []
+def test_non_anthropic_host_emits_network_request():
+    flow = _make_flow("/v1/initialize", req_body={},
+                      resp_body={}, host="statsig.anthropic.com")
+    events = _run(flow)
+    assert [e.phase for e in events] == [Phase.NETWORK_REQUEST]
+    evt = events[0]
+    assert evt.meta["host"] == "statsig.anthropic.com"
+    assert evt.meta["category"] == "feature_flags"
+    assert evt.meta["status"] == 200
+    assert evt.error is None
+    assert evt.duration_ms is not None and evt.duration_ms >= 0
+
+
+def test_unknown_host_is_still_reported():
+    flow = _make_flow("/whatever", req_body={}, resp_body={}, host="example.com")
+    events = _run(flow)
+    assert [e.phase for e in events] == [Phase.NETWORK_REQUEST]
+    assert events[0].meta["category"] == "unknown"
+
+
+def test_boot_checkin_error_emits_network_request_with_purpose():
+    # The /api/claude_cli_profile 400 seen on every Claude Code boot: it must
+    # surface as a categorised check-in, not as an inference api_request_error.
+    flow = _make_flow(
+        "/api/claude_cli_profile?account_uuid=abc",
+        req_body={},
+        resp_body={"type": "error",
+                   "error": {"message": "API key creator does not match"}},
+        status=400,
+    )
+    events = _run(flow)
+    assert [e.phase for e in events] == [Phase.NETWORK_REQUEST]
+    evt = events[0]
+    assert evt.error == "HTTP 400"
+    assert evt.meta["category"] == "account"
+    assert "profile" in evt.meta["purpose"]
+    assert "does not match" in evt.meta["body"]
+
+
+def test_settings_checkin_404_is_categorised_config():
+    flow = _make_flow("/api/claude_code/settings", req_body={},
+                      resp_body={"type": "error"}, status=404)
+    events = _run(flow)
+    assert [e.phase for e in events] == [Phase.NETWORK_REQUEST]
+    assert events[0].meta["category"] == "config"
+    assert "404" in events[0].meta["purpose"] or "settings" in events[0].meta["purpose"]
 
 
 def test_sse_response_does_not_emit_json_roundtrip_events():

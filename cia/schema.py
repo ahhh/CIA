@@ -24,6 +24,11 @@ class Phase(str, Enum):
     TOKENIZER_START = "tokenizer_start"
     TOKENIZER_END   = "tokenizer_end"
 
+    # Any other HTTP traffic through the proxy (check-ins, telemetry,
+    # feature flags, updates) — everything that isn't an inference or
+    # tokenizer call, tagged with why Claude Code made the request.
+    NETWORK_REQUEST = "network_request"
+
     # Tool calls (from Claude Code hooks)
     TOOL_CALL_START  = "tool_call_start"
     TOOL_CALL_END    = "tool_call_end"
