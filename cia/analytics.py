@@ -5,10 +5,13 @@ All functions take a time-sorted list of Event objects (as returned by
 Store.query, or parsed from an exported JSONL file) and return plain
 dicts/lists so results can be rendered as tables or dumped as JSON.
 
-Correlation caveat: proxy-derived events (api_*) carry no session_id, so
-turn-level attribution matches them to hook events by time window.  With
-multiple concurrent Claude sessions, one session's api_* events can land
-in another session's turn; single-session captures are exact.
+Correlation: proxy-derived events (api_*) carry no session_id of their
+own.  When Claude Code's native telemetry was captured (cia run), the
+Anthropic request-id — recorded by the proxy from the response header and
+by the otel api_request event alongside session.id — joins them to their
+session exactly.  Events without that join (telemetry off, or pre-join
+captures) fall back to time-window matching, which can misattribute
+across concurrent sessions; single-session captures are exact either way.
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ import time
 from typing import Any, Optional
 
 from cia.schema import Event, Phase
+from cia.transcripts import is_sandbox_path as _is_sandbox_path
+from cia.transcripts import project_display as _project_display
 
 _EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
@@ -61,6 +66,63 @@ def _context_tokens(e: Event) -> int:
         + (meta.get("cache_read_input_tokens") or usage.get("cache_read_input_tokens") or 0)
         + (meta.get("cache_creation_input_tokens") or usage.get("cache_creation_input_tokens") or 0)
     )
+
+
+_API_PHASES = {
+    Phase.API_REQUEST_START, Phase.API_FIRST_TOKEN, Phase.API_THINKING_START,
+    Phase.API_THINKING_END, Phase.API_GENERATION_START,
+    Phase.API_GENERATION_END, Phase.API_RESPONSE_END, Phase.API_REQUEST_ERROR,
+    Phase.API_PROGRESS,
+}
+
+
+def api_flow_sessions(events: list[Event]) -> dict[str, str]:
+    """Exact flow_id → session_id map for proxy API events.
+
+    Claude Code's native api_request / api_error telemetry carries both the
+    Anthropic request-id and the session.id; the proxy records the same
+    request-id from the response header.  Joining the two pins every proxied
+    flow to its session — no time-window guessing.  Flows absent from the
+    map (native telemetry off, or the header was missing) keep the
+    time-window fallback.
+    """
+    rid_sid: dict[str, str] = {}
+    for e in events:
+        if e.phase != Phase.OTEL_EVENT:
+            continue
+        meta = e.meta or {}
+        if meta.get("name") not in ("api_request", "api_error"):
+            continue
+        attrs = meta.get("attributes") or {}
+        rid = attrs.get("request_id")
+        sid = e.session_id or attrs.get("session.id")
+        if rid and sid:
+            rid_sid[str(rid)] = str(sid)
+
+    flow_sid: dict[str, str] = {}
+    for e in events:
+        if e.phase not in _API_PHASES:
+            continue
+        meta = e.meta or {}
+        rid, fid = meta.get("request_id"), meta.get("flow_id")
+        if rid and fid:
+            sid = rid_sid.get(str(rid))
+            if sid:
+                flow_sid[fid] = sid
+    return flow_sid
+
+
+def _session_filter(flow_sid: dict[str, str], sid) -> "callable":
+    """Predicate: does this proxy API event belong to session `sid`?
+
+    True when the flow was exactly joined to `sid`, or was never joined at
+    all (fallback: caller still applies its time window); False only when
+    the flow is known to belong to a *different* session.
+    """
+    def ok(e: Event) -> bool:
+        known = flow_sid.get((e.meta or {}).get("flow_id"))
+        return known is None or known == sid
+    return ok
 
 
 def pair_tool_calls(events: list[Event]) -> list[dict]:
@@ -209,7 +271,36 @@ def human_latency(events: list[Event]) -> dict:
             "input": _summary(input_waits),
             "think": _summary(think_times),
         },
+        "native_active_time": _native_active_time(events),
     }
+
+
+def _native_active_time(events: list[Event]) -> Optional[dict]:
+    """Claude Code's own active-time split (claude_code.active_time.total):
+    seconds the user was at the keyboard vs. the CLI doing work — an
+    independent cross-check on the hook-derived wait estimates above."""
+    series: dict[tuple, list] = {}
+    temporality: dict[tuple, str] = {}
+    for e in events:
+        if e.phase != Phase.OTEL_METRIC:
+            continue
+        meta = e.meta or {}
+        if meta.get("name") != "claude_code.active_time.total" \
+                or meta.get("value") is None:
+            continue
+        attrs = meta.get("attributes") or {}
+        key = (e.session_id, str(attrs.get("type") or "?"))
+        series.setdefault(key, []).append((e.ts, float(meta["value"])))
+        if meta.get("temporality"):
+            temporality[key] = meta["temporality"]
+    if not series:
+        return None
+    totals: dict[str, float] = {}
+    for key, points in series.items():
+        points.sort()
+        total = sum(d for _, d in _series_deltas(points, temporality.get(key)))
+        totals[key[1]] = totals.get(key[1], 0.0) + total
+    return {"user_s": totals.get("user", 0.0), "cli_s": totals.get("cli", 0.0)}
 
 
 # ------------------------------------------------------------------ #
@@ -224,6 +315,11 @@ def compaction_cost(events: list[Event], window_s: float = 600.0,
     hook.  The first request *after* compaction is often the summarisation
     call itself (still large), so context_after takes the minimum context
     over the next `lookahead` requests within `window_s`.
+
+    When native telemetry was captured, each row is additionally enriched
+    with Claude Code's own `compaction` event (exact pre/post token counts,
+    duration and success) matched by session + time proximity; native
+    compactions with no PreCompact hook nearby become rows of their own.
     """
     starts = [(e.ts, _context_tokens(e)) for e in events
               if e.phase == Phase.API_REQUEST_START]
@@ -247,7 +343,43 @@ def compaction_cost(events: list[Event], window_s: float = 600.0,
                 else None
             ),
             "recovery_s": (after[0][0] - e.ts) if after else None,
+            "native": None,
         })
+
+    for e, attrs in _named_otel_events(events, "compaction"):
+        native = {
+            "trigger": attrs.get("trigger"),
+            "success": str(attrs.get("success")).lower() != "false",
+            "duration_ms": _num(attrs.get("duration_ms")),
+            "pre_tokens": _num(attrs.get("pre_tokens")),
+            "post_tokens": _num(attrs.get("post_tokens")),
+        }
+        host = min(
+            (r for r in results if r["native"] is None
+             and (r["session_id"] is None or e.session_id is None
+                  or r["session_id"] == e.session_id)
+             and abs(r["ts"] - e.ts) <= 120.0),
+            key=lambda r: abs(r["ts"] - e.ts), default=None)
+        if host is not None:
+            host["native"] = native
+            if native["pre_tokens"] is not None and native["post_tokens"] is not None:
+                host["reclaimed_tokens"] = int(
+                    native["pre_tokens"] - native["post_tokens"])
+        else:
+            results.append({
+                "ts": e.ts,
+                "session_id": e.session_id,
+                "trigger": attrs.get("trigger"),
+                "context_before": native["pre_tokens"],
+                "context_after": native["post_tokens"],
+                "reclaimed_tokens": (
+                    int(native["pre_tokens"] - native["post_tokens"])
+                    if native["pre_tokens"] is not None
+                    and native["post_tokens"] is not None else None),
+                "recovery_s": None,
+                "native": native,
+            })
+    results.sort(key=lambda r: r["ts"])
     return results
 
 
@@ -259,8 +391,9 @@ def turn_anatomy(events: list[Event]) -> list[dict]:
     """Break each turn's wall-clock into model / tool / human components.
 
     A turn is user_prompt → the next turn_end in the same session.  api_*
-    events are attributed by time window (see module docstring), tool calls
-    and permission waits by session + time window.
+    events are attributed exactly via the request-id join when native
+    telemetry was captured, by time window otherwise (see module
+    docstring); tool calls and permission waits by session + time window.
 
     A turn still open at the end of the capture (no turn_end yet — in
     progress, or the session died) is closed at the last event seen for
@@ -268,6 +401,7 @@ def turn_anatomy(events: list[Event]) -> list[dict]:
     """
     pairs = pair_tool_calls(events)
     hl = human_latency(events)
+    flow_sid = api_flow_sessions(events)
 
     turns: list[dict] = []
     sessions = {e.session_id for e in events if e.session_id}
@@ -278,10 +412,11 @@ def turn_anatomy(events: list[Event]) -> list[dict]:
             if e.phase == Phase.USER_PROMPT and open_prompt is None:
                 open_prompt = e
             elif e.phase == Phase.TURN_END and open_prompt is not None:
-                turns.append(_one_turn(open_prompt, e, events, pairs, hl))
+                turns.append(_one_turn(open_prompt, e, events, pairs, hl,
+                                       flow_sid))
                 open_prompt = None
         if open_prompt is not None and sev[-1].ts > open_prompt.ts:
-            turn = _one_turn(open_prompt, sev[-1], events, pairs, hl)
+            turn = _one_turn(open_prompt, sev[-1], events, pairs, hl, flow_sid)
             turn["complete"] = False
             turns.append(turn)
 
@@ -290,24 +425,30 @@ def turn_anatomy(events: list[Event]) -> list[dict]:
 
 
 def _one_turn(prompt: Event, end: Event, events: list[Event],
-              pairs: list[dict], hl: dict) -> dict:
+              pairs: list[dict], hl: dict,
+              flow_sid: Optional[dict[str, str]] = None) -> dict:
     sid = prompt.session_id
     t0, t1 = prompt.ts, end.ts
+    mine = _session_filter(flow_sid or {}, sid)
 
     def in_window(ts: float) -> bool:
         return t0 <= ts <= t1
 
     api_ends = [e for e in events
-                if e.phase == Phase.API_RESPONSE_END and in_window(e.ts)]
+                if e.phase == Phase.API_RESPONSE_END and in_window(e.ts)
+                and mine(e)]
     api_ms = sum(e.duration_ms or 0 for e in api_ends)
     thinking_ms = sum(e.duration_ms or 0 for e in events
-                      if e.phase == Phase.API_THINKING_END and in_window(e.ts))
+                      if e.phase == Phase.API_THINKING_END and in_window(e.ts)
+                      and mine(e))
     generation_ms = sum(e.duration_ms or 0 for e in events
-                        if e.phase == Phase.API_GENERATION_END and in_window(e.ts))
+                        if e.phase == Phase.API_GENERATION_END
+                        and in_window(e.ts) and mine(e))
     tokens_out = sum(e.tokens_output or 0 for e in api_ends)
 
     req_starts = [e for e in events
-                  if e.phase == Phase.API_REQUEST_START and in_window(e.ts)]
+                  if e.phase == Phase.API_REQUEST_START and in_window(e.ts)
+                  and mine(e)]
     context_tokens = _context_tokens(req_starts[-1]) if req_starts else None
 
     turn_pairs = [p for p in pairs
@@ -395,30 +536,42 @@ def rework(events: list[Event], threshold: int = 3) -> list[dict]:
 # Session stories                                                      #
 # ------------------------------------------------------------------ #
 
-def session_stories(events: list[Event]) -> list[dict]:
+def session_stories(events: list[Event],
+                    transcripts: Optional[dict] = None,
+                    insights: Optional[dict] = None) -> list[dict]:
     """Per-session rollup with explicit coverage diagnostics.
 
     Aggregates turns, API usage, tool activity and human latency for each
     session, and reports which collectors actually contributed data —
     so an all-zero API column reads as "this session was not proxied"
     instead of silent dashes.
+
+    ``transcripts`` / ``insights`` (from cia.transcripts) add session
+    identity (title, project, outcome) and fill the token/model columns
+    from the on-disk transcript when the session was never proxied.
     """
+    transcripts = transcripts or {}
+    insights = insights or {}
     turns = turn_anatomy(events)
     hl = human_latency(events)
     pairs = pair_tool_calls(events)
+    flow_sid = api_flow_sessions(events)
 
     stories = []
     for sid in sorted({e.session_id for e in events if e.session_id}):
         sev = [e for e in events if e.session_id == sid]
         t0, t1 = sev[0].ts, sev[-1].ts
+        mine = _session_filter(flow_sid, sid)
 
         def in_window(ts: float) -> bool:
             return t0 <= ts <= t1
 
         api_ends = [e for e in events
-                    if e.phase == Phase.API_RESPONSE_END and in_window(e.ts)]
+                    if e.phase == Phase.API_RESPONSE_END and in_window(e.ts)
+                    and mine(e)]
         api_starts = [e for e in events
-                      if e.phase == Phase.API_REQUEST_START and in_window(e.ts)]
+                      if e.phase == Phase.API_REQUEST_START and in_window(e.ts)
+                      and mine(e)]
         has_proxy = bool(api_ends or api_starts or any(
             e.phase in (Phase.TOKENIZER_START, Phase.TOKENIZER_END)
             and in_window(e.ts) for e in events))
@@ -432,11 +585,30 @@ def session_stories(events: list[Event]) -> list[dict]:
         end_event = next((e for e in reversed(sev)
                           if e.phase == Phase.SESSION_END), None)
 
+        tr = transcripts.get(sid)
+        ins = insights.get(sid) or {}
+
+        tokens_input = sum(e.tokens_input or 0 for e in api_ends)
+        tokens_output = sum(e.tokens_output or 0 for e in api_ends)
+        models = sorted({e.model for e in api_ends if e.model})
+        token_source = "proxy" if has_proxy else None
+        if not has_proxy and tr and tr["usage"]["output"]:
+            # Session never went through the proxy, but its transcript holds
+            # the exact usage Claude Code saved from each API response.
+            tokens_input = tr["usage"]["input"]
+            tokens_output = tr["usage"]["output"]
+            cache_read = tr["usage"]["cache_read"]
+            models = sorted(m for m in tr["by_model"] if m != "?")
+            token_source = "transcript"
+
         gaps = []
         if not has_proxy:
+            filled = (" — token/model columns filled from the session "
+                      "transcript" if token_source == "transcript" else
+                      "; API, thinking and tokenizer fields are blank")
             gaps.append("no proxy data — session not routed through CIA "
-                        "(launch claude with HTTPS_PROXY / NODE_EXTRA_CA_CERTS); "
-                        "API, thinking and tokenizer fields are blank")
+                        "(launch claude with HTTPS_PROXY / NODE_EXTRA_CA_CERTS)"
+                        + filled)
         if not has_fswatch:
             gaps.append("no fswatch data — daemon started without --watch-dir")
         if not any(e.phase == Phase.TURN_END for e in sev):
@@ -445,6 +617,10 @@ def session_stories(events: list[Event]) -> list[dict]:
 
         stories.append({
             "session_id": sid,
+            "title": tr["title"] if tr else None,
+            "project": (_project_display(tr["project_path"])
+                        if tr and tr["project_path"] else None),
+            "outcome": ins.get("outcome"),
             "start_ts": t0,
             "end_ts": t1,
             "duration_s": t1 - t0,
@@ -454,13 +630,15 @@ def session_stories(events: list[Event]) -> list[dict]:
             "incomplete_turns": sum(1 for t in session_turns if not t["complete"]),
             "prompts": sum(1 for e in sev if e.phase == Phase.USER_PROMPT),
             "api_calls": len(api_ends),
-            "tokens_input": sum(e.tokens_input or 0 for e in api_ends),
-            "tokens_output": sum(e.tokens_output or 0 for e in api_ends),
+            "tokens_input": tokens_input,
+            "tokens_output": tokens_output,
+            "token_source": token_source,
             "cache_read_tokens": cache_read,
             "thinking_ms": sum(e.duration_ms or 0 for e in events
                                if e.phase == Phase.API_THINKING_END
-                               and in_window(e.ts)),
-            "models": sorted({e.model for e in api_ends if e.model}),
+                               and in_window(e.ts) and mine(e)),
+            "api_flows_joined": sum(1 for s in flow_sid.values() if s == sid),
+            "models": models,
             "tool_calls": len(tool_calls),
             "tool_errors": sum(1 for p in tool_calls if p["is_error"]),
             "tool_ms": sum(p["duration_ms"] for p in tool_calls),
@@ -474,7 +652,8 @@ def session_stories(events: list[Event]) -> list[dict]:
                                if e.phase == Phase.CONTEXT_COMPACT),
             "subagents": sum(1 for e in sev if e.phase == Phase.SUBAGENT_END),
             "coverage": {"hooks": True, "proxy": has_proxy,
-                         "fswatch": has_fswatch},
+                         "fswatch": has_fswatch,
+                         "transcripts": tr is not None},
             "gaps": gaps,
         })
     return stories
@@ -906,15 +1085,22 @@ _OTEL_COMMITS = "claude_code.commit.count"
 _COST_METRICS = (_OTEL_COST, _OTEL_TOKENS, _OTEL_LINES, _OTEL_COMMITS)
 
 
-def _series_deltas(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+def _series_deltas(points: list[tuple[float, float]],
+                   temporality: Optional[str] = None) -> list[tuple[float, float]]:
     """Per-export increments of an OTLP counter series.
 
-    Claude Code's exporter reports counters cumulatively (each export
-    repeats the running total), so a non-decreasing series is differenced;
-    anything else is treated as already-delta and passed through.
+    When the export's aggregation temporality is known (cia run requests
+    delta; the receiver records what actually arrived), it decides exactly:
+    delta series pass through, cumulative series are differenced.  With no
+    recorded temporality (older captures), fall back to the heuristic — a
+    non-decreasing series is treated as cumulative and differenced.
     """
     vals = [v for _, v in points]
-    if len(vals) >= 2 and all(b >= a for a, b in zip(vals, vals[1:])):
+    if temporality == "delta":
+        deltas = vals
+    elif temporality == "cumulative" or (
+            temporality is None and len(vals) >= 2
+            and all(b >= a for a, b in zip(vals, vals[1:]))):
         deltas = [vals[0]] + [b - a for a, b in zip(vals, vals[1:])]
     else:
         deltas = vals
@@ -926,11 +1112,12 @@ def cost_attribution(events: list[Event]) -> dict:
 
     Each cost increment is attributed to the most recent turn of its
     session that started before the metric export (exports lag the work by
-    up to the export interval, ~10s).  A rework turn re-edits a file
+    up to the export interval — 2s under cia run).  A rework turn re-edits a file
     already edited earlier in the session, or edits the same file more
     than once.
     """
     series: dict[tuple, list] = {}
+    temporality: dict[tuple, str] = {}
     for e in events:
         if e.phase != Phase.OTEL_METRIC:
             continue
@@ -941,8 +1128,10 @@ def cost_attribution(events: list[Event]) -> dict:
         attrs = meta.get("attributes") or {}
         attr_key = tuple(sorted((k, str(v)) for k, v in attrs.items()
                                 if k not in ("session.id", "session_id")))
-        series.setdefault((e.session_id, name, attr_key), []).append(
-            (e.ts, float(meta["value"])))
+        key = (e.session_id, name, attr_key)
+        series.setdefault(key, []).append((e.ts, float(meta["value"])))
+        if meta.get("temporality"):
+            temporality[key] = meta["temporality"]
 
     if not series:
         return {"available": False}
@@ -956,7 +1145,7 @@ def cost_attribution(events: list[Event]) -> dict:
             "cost_usd": 0.0, "tokens": {}, "lines_added": 0,
             "lines_removed": 0, "commits": 0,
         })
-        deltas = _series_deltas(points)
+        deltas = _series_deltas(points, temporality.get((sid, name, attr_key)))
         total = sum(d for _, d in deltas)
         if name == _OTEL_COST:
             s["cost_usd"] += total
@@ -1187,13 +1376,387 @@ def network_overhead(events: list[Event]) -> dict:
 
 
 # ------------------------------------------------------------------ #
+# Native-telemetry insights                                            #
+# ------------------------------------------------------------------ #
+
+# tool_decision sources that mean nobody was interrupted
+_AUTO_DECISION_SOURCES = {"config", "hook"}
+
+
+def _num(v) -> Optional[float]:
+    """Coerce an OTLP attribute to a float (attrs often arrive as strings)."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _named_otel_events(events: list[Event], name: str) -> list[tuple[Event, dict]]:
+    return [(e, (e.meta or {}).get("attributes") or {})
+            for e in events
+            if e.phase == Phase.OTEL_EVENT and (e.meta or {}).get("name") == name]
+
+
+def otel_insights(events: list[Event]) -> dict:
+    """Analytics over Claude Code's own telemetry events (otel_event):
+    permission economics, API reliability, cost by subsystem, hook
+    overhead, MCP connection health, internal errors and session starts.
+    Everything here is unavailable unless the session ran under cia run.
+    """
+    permissions = _permission_economics(events)
+    reliability = _api_reliability(events)
+    subsystems = _cost_by_subsystem(events)
+    hooks = _hook_overhead(events)
+    mcp = _mcp_health(events)
+    errors = _internal_errors(events)
+    starts = _session_starts(events)
+    available = any((permissions["decisions"], reliability["available"],
+                     subsystems["available"], hooks["hooks"], mcp["attempts"],
+                     errors["internal_errors"] or errors["auth_failures"],
+                     starts))
+    return {
+        "available": available,
+        "permissions": permissions,
+        "api_reliability": reliability,
+        "subsystems": subsystems,
+        "hooks": hooks,
+        "mcp": mcp,
+        "errors": errors,
+        "session_starts": starts,
+    }
+
+
+def _permission_economics(events: list[Event]) -> dict:
+    """tool_decision events: who approved what, and how often it was free
+    (auto-approved by config/hook) vs. an interruption."""
+    by_source: dict[str, int] = {}
+    by_tool: dict[str, dict] = {}
+    total = accepts = auto = 0
+    for _, attrs in _named_otel_events(events, "tool_decision"):
+        total += 1
+        decision = str(attrs.get("decision") or "?")
+        source = str(attrs.get("source") or "?")
+        tool = str(attrs.get("tool_name") or "?")
+        accepts += decision == "accept"
+        auto += source in _AUTO_DECISION_SOURCES
+        by_source[source] = by_source.get(source, 0) + 1
+        t = by_tool.setdefault(tool, {"accepts": 0, "rejects": 0})
+        t["accepts" if decision == "accept" else "rejects"] += 1
+    return {
+        "decisions": total,
+        "accepts": accepts,
+        "rejects": total - accepts,
+        "auto_approved": auto,
+        "auto_rate": auto / total if total else None,
+        "by_source": by_source,
+        "by_tool": by_tool,
+    }
+
+
+def _api_reliability(events: list[Event]) -> dict:
+    """api_error / api_retries_exhausted / api_refusal telemetry."""
+    errors = []
+    for e, attrs in _named_otel_events(events, "api_error"):
+        errors.append({
+            "ts": e.ts,
+            "model": attrs.get("model"),
+            "status_code": attrs.get("status_code"),
+            "attempt": _num(attrs.get("attempt")),
+            "duration_ms": _num(attrs.get("duration_ms")),
+            "error": str(attrs.get("error") or "")[:200],
+        })
+    by_status: dict[str, int] = {}
+    for r in errors:
+        key = str(r["status_code"] if r["status_code"] is not None else "non-http")
+        by_status[key] = by_status.get(key, 0) + 1
+
+    exhausted = []
+    for e, attrs in _named_otel_events(events, "api_retries_exhausted"):
+        exhausted.append({
+            "ts": e.ts,
+            "model": attrs.get("model"),
+            "status_code": attrs.get("status_code"),
+            "total_attempts": _num(attrs.get("total_attempts")),
+            "retry_ms": _num(attrs.get("total_retry_duration_ms")),
+        })
+
+    refusals = []
+    for e, attrs in _named_otel_events(events, "api_refusal"):
+        refusals.append({
+            "ts": e.ts,
+            "model": attrs.get("model"),
+            "category": attrs.get("category"),   # only under --detail
+            "has_category": attrs.get("has_category"),
+            "server_fallback_hop": attrs.get("server_fallback_hop"),
+        })
+
+    return {
+        "available": bool(errors or exhausted or refusals),
+        "errors": len(errors),
+        "errors_by_status": by_status,
+        "error_ms": sum(r["duration_ms"] or 0 for r in errors),
+        "retries_exhausted": exhausted,
+        "retry_ms_lost": sum(x["retry_ms"] or 0 for x in exhausted),
+        "refusals": refusals,
+    }
+
+
+_ATTRIBUTION_KEYS = ("agent.name", "skill.name", "mcp_server.name",
+                     "plugin.name")
+
+
+def _cost_by_subsystem(events: list[Event]) -> dict:
+    """api_request telemetry aggregated by query_source (main thread vs
+    subagent vs compaction vs auxiliary) and by agent/skill/MCP attribution."""
+    by_source: dict[str, dict] = {}
+    attribution: dict[str, dict] = {k: {} for k in _ATTRIBUTION_KEYS}
+    requests = 0
+    for _, attrs in _named_otel_events(events, "api_request"):
+        requests += 1
+        qs = str(attrs.get("query_source") or "?")
+        g = by_source.setdefault(qs, {
+            "requests": 0, "cost_usd": 0.0, "input_tokens": 0,
+            "output_tokens": 0, "cache_read_tokens": 0, "api_ms": 0.0,
+        })
+        g["requests"] += 1
+        g["cost_usd"] += _num(attrs.get("cost_usd")) or 0.0
+        g["input_tokens"] += int(_num(attrs.get("input_tokens")) or 0)
+        g["output_tokens"] += int(_num(attrs.get("output_tokens")) or 0)
+        g["cache_read_tokens"] += int(_num(attrs.get("cache_read_tokens")) or 0)
+        g["api_ms"] += _num(attrs.get("duration_ms")) or 0.0
+        for key in _ATTRIBUTION_KEYS:
+            val = attrs.get(key)
+            if val:
+                a = attribution[key].setdefault(
+                    str(val), {"requests": 0, "cost_usd": 0.0})
+                a["requests"] += 1
+                a["cost_usd"] += _num(attrs.get("cost_usd")) or 0.0
+    return {
+        "available": requests > 0,
+        "requests": requests,
+        "by_query_source": by_source,
+        "attribution": {k: v for k, v in attribution.items() if v},
+    }
+
+
+def _hook_overhead(events: list[Event]) -> dict:
+    """hook_execution_complete telemetry: what each hook (including CIA's
+    own instrumentation hooks) costs the session."""
+    by_hook: dict[str, dict] = {}
+    for _, attrs in _named_otel_events(events, "hook_execution_complete"):
+        name = str(attrs.get("hook_name") or attrs.get("hook_event") or "?")
+        g = by_hook.setdefault(name, {"runs": 0, "total_ms": 0.0,
+                                      "durations": [], "blocking": 0,
+                                      "errors": 0})
+        dur = _num(attrs.get("total_duration_ms")) or 0.0
+        g["runs"] += 1
+        g["total_ms"] += dur
+        g["durations"].append(dur)
+        g["blocking"] += int(_num(attrs.get("num_blocking")) or 0)
+        g["errors"] += int(_num(attrs.get("num_non_blocking_error")) or 0)
+    hooks = [
+        {"hook": name, "runs": g["runs"], "total_ms": g["total_ms"],
+         "p50_ms": _percentile(sorted(g["durations"]), 50),
+         "max_ms": max(g["durations"]) if g["durations"] else None,
+         "blocking": g["blocking"], "errors": g["errors"]}
+        for name, g in by_hook.items()
+    ]
+    hooks.sort(key=lambda h: h["total_ms"], reverse=True)
+    return {"hooks": hooks,
+            "total_ms": sum(h["total_ms"] for h in hooks)}
+
+
+def _mcp_health(events: list[Event]) -> dict:
+    """mcp_server_connection telemetry: connect times and failures."""
+    by_status: dict[str, int] = {}
+    connect_ms: list[float] = []
+    failures: list[dict] = []
+    attempts = 0
+    for e, attrs in _named_otel_events(events, "mcp_server_connection"):
+        attempts += 1
+        status = str(attrs.get("status") or "?")
+        by_status[status] = by_status.get(status, 0) + 1
+        dur = _num(attrs.get("duration_ms"))
+        if status == "connected" and dur is not None:
+            connect_ms.append(dur)
+        if status == "failed":
+            failures.append({
+                "ts": e.ts,
+                "server": attrs.get("server_name"),   # only under --detail
+                "transport": attrs.get("transport_type"),
+                "error_code": attrs.get("error_code"),
+                "duration_ms": dur,
+            })
+    return {
+        "attempts": attempts,
+        "by_status": by_status,
+        "connect_ms": _pctl_summary(connect_ms),
+        "failures": failures,
+    }
+
+
+def _internal_errors(events: list[Event]) -> dict:
+    """internal_error and failed auth telemetry."""
+    internal: dict[str, int] = {}
+    for _, attrs in _named_otel_events(events, "internal_error"):
+        key = "/".join(str(attrs.get(k)) for k in ("error_name", "error_code")
+                       if attrs.get(k)) or "?"
+        internal[key] = internal.get(key, 0) + 1
+    auth_failures = sum(
+        1 for _, attrs in _named_otel_events(events, "auth")
+        if str(attrs.get("success")).lower() == "false")
+    return {"internal_errors": internal, "auth_failures": auth_failures}
+
+
+def _session_starts(events: list[Event]) -> dict:
+    """claude_code.session.count metric: sessions by start_type (fresh /
+    resume / continue), counted as distinct session ids per type."""
+    seen: dict[str, set] = {}
+    for e in events:
+        if e.phase != Phase.OTEL_METRIC:
+            continue
+        meta = e.meta or {}
+        if meta.get("name") != "claude_code.session.count":
+            continue
+        attrs = meta.get("attributes") or {}
+        start_type = str(attrs.get("start_type") or "?")
+        sid = e.session_id or "?"
+        seen.setdefault(start_type, set()).add(sid)
+    return {k: len(v) for k, v in sorted(seen.items())}
+
+
+# ------------------------------------------------------------------ #
+# Transcript insights                                                  #
+# ------------------------------------------------------------------ #
+
+def _otel_output_tokens(events: list[Event]) -> dict[Optional[str], float]:
+    """Per-session output-token totals from claude_code.token.usage."""
+    series: dict[tuple, list] = {}
+    temporality: dict[tuple, str] = {}
+    for e in events:
+        if e.phase != Phase.OTEL_METRIC:
+            continue
+        meta = e.meta or {}
+        attrs = meta.get("attributes") or {}
+        if (meta.get("name") != "claude_code.token.usage"
+                or attrs.get("type") != "output" or meta.get("value") is None):
+            continue
+        attr_key = tuple(sorted((k, str(v)) for k, v in attrs.items()))
+        key = (e.session_id, attr_key)
+        series.setdefault(key, []).append((e.ts, float(meta["value"])))
+        if meta.get("temporality"):
+            temporality[key] = meta["temporality"]
+    totals: dict[Optional[str], float] = {}
+    for key, points in series.items():
+        points.sort()
+        total = sum(d for _, d in _series_deltas(points, temporality.get(key)))
+        totals[key[0]] = totals.get(key[0], 0.0) + total
+    return totals
+
+
+def transcript_insights(events: list[Event],
+                        transcripts: Optional[dict] = None,
+                        insights: Optional[dict] = None) -> dict:
+    """Analytics over Claude Code's on-disk transcripts and /insights data
+    for the sessions in the event store: session identity, exact usage,
+    per-agent-type subagent economics, delivery stats, and a three-way
+    output-token agreement check (transcript vs proxy vs native telemetry).
+    """
+    sids = sorted({e.session_id for e in events if e.session_id})
+    if transcripts is None or insights is None:
+        from cia.transcripts import load_insights, session_transcripts
+        if transcripts is None:
+            transcripts = session_transcripts(sids)
+        if insights is None:
+            insights = load_insights(sids)
+    if not transcripts and not insights:
+        return {"available": False}
+
+    flow_sid = api_flow_sessions(events)
+    otel_output = _otel_output_tokens(events)
+
+    sessions: dict[str, dict] = {}
+    subagents: dict[str, dict] = {}
+    for sid in sids:
+        tr = transcripts.get(sid)
+        ins = insights.get(sid) or {}
+        if not tr and not ins:
+            continue
+
+        proxy_output = 0
+        if tr or ins:
+            sev = [e for e in events if e.session_id == sid]
+            t0, t1 = sev[0].ts, sev[-1].ts
+            mine = _session_filter(flow_sid, sid)
+            proxy_output = sum(
+                e.tokens_output or 0 for e in events
+                if e.phase == Phase.API_RESPONSE_END and t0 <= e.ts <= t1
+                and mine(e))
+
+        transcript_output = tr["usage"]["output"] if tr else 0
+        sources = {"transcript": transcript_output,
+                   "proxy": proxy_output,
+                   "otel": otel_output.get(sid, 0.0)}
+        present = {k: v for k, v in sources.items() if v}
+        disagreement = None
+        if len(present) >= 2:
+            lo, hi = min(present.values()), max(present.values())
+            disagreement = round((hi - lo) / hi, 4) if hi else 0.0
+
+        entry = {
+            "title": tr["title"] if tr else None,
+            "project": _project_display(tr["project_path"]) if tr else None,
+            "sandbox": _is_sandbox_path(tr["project_path"]) if tr else False,
+            "usage": tr["usage"] if tr else None,
+            "by_model": tr["by_model"] if tr else {},
+            "prompts": len(tr["prompts"]) if tr else 0,
+            "subagents": len(tr["subagents"]) if tr else 0,
+            "insights": ins or None,
+            "agreement": {"output_tokens": sources,
+                          "disagreement_frac": disagreement},
+        }
+        sessions[sid] = entry
+
+        for sub in (tr["subagents"] if tr else []):
+            g = subagents.setdefault(sub["agent_type"], {
+                "runs": 0, "output_tokens": 0, "input_tokens": 0,
+                "cache_read_tokens": 0, "tool_calls": 0,
+            })
+            g["runs"] += 1
+            g["output_tokens"] += sub["usage"]["output"]
+            g["input_tokens"] += sub["usage"]["input"]
+            g["cache_read_tokens"] += sub["usage"]["cache_read"]
+            g["tool_calls"] += sub["tool_calls"]
+
+    return {
+        "available": bool(sessions),
+        "sessions": sessions,
+        "subagent_economics": subagents,
+    }
+
+
+# ------------------------------------------------------------------ #
 # Full report                                                          #
 # ------------------------------------------------------------------ #
 
-def full_report(events: list[Event]) -> dict[str, Any]:
-    """All derived analytics in one JSON-serialisable dict."""
+def full_report(events: list[Event],
+                use_transcripts: bool = True) -> dict[str, Any]:
+    """All derived analytics in one JSON-serialisable dict.
+
+    ``use_transcripts=False`` skips reading Claude Code's on-disk
+    transcripts / usage-data (cia report --no-transcripts).
+    """
+    if use_transcripts:
+        from cia.transcripts import load_insights, session_transcripts
+        sids = sorted({e.session_id for e in events if e.session_id})
+        transcripts = session_transcripts(sids)
+        insights = load_insights(sids)
+    else:
+        transcripts, insights = {}, {}
     return {
-        "sessions": session_stories(events),
+        "sessions": session_stories(events, transcripts, insights),
         "turns": turn_anatomy(events),
         "tools": tool_profiles(events),
         "chains": tool_chains(events),
@@ -1206,4 +1769,6 @@ def full_report(events: list[Event]) -> dict[str, Any]:
         "cost": cost_attribution(events),
         "throughput": throughput(events),
         "network": network_overhead(events),
+        "otel": otel_insights(events),
+        "transcripts": transcript_insights(events, transcripts, insights),
     }

@@ -91,6 +91,34 @@ Response:
 
 ---
 
+### `backup`
+
+Snapshots all report data into `dir` and returns where it landed. The SQLite
+copy is taken with the online backup API, so it is consistent even while the
+daemon keeps recording; the JSONL mirror is copied alongside it.
+
+```json
+{"cmd": "backup", "dir": "/path/to/dest"}
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "dir": "/path/to/dest",
+  "db": "/path/to/dest/cia.db",
+  "jsonl": "/path/to/dest/events.jsonl",
+  "events": 1423
+}
+```
+
+`jsonl` is omitted when the daemon was started without a JSONL mirror. Returns
+`{"ok": false, "error": "backup requires a 'dir'"}` if `dir` is missing.
+
+Exposed on the CLI as `cia report --backup [DIR]`.
+
+---
+
 ### `stop`
 
 Stops the daemon gracefully.

@@ -59,6 +59,12 @@ def _parse_json_body(message) -> dict:
         return {}
 
 
+def _request_id(flow: http.HTTPFlow) -> Optional[str]:
+    """Anthropic's `request-id` response header — the join key that Claude
+    Code's native telemetry (otel api_request events) also carries."""
+    return flow.response.headers.get("request-id") or None
+
+
 def _error_body(flow: http.HTTPFlow) -> str:
     """Response body text of a failed request; '' on decode failure."""
     try:
@@ -170,6 +176,7 @@ class CIAAddon:
             info = self._req_info.get(flow.id, {})
             parser.set_request_start(info.get("ts", time.time()))
             parser.set_request_info(info.get("anatomy") or {})
+            parser.set_request_id(_request_id(flow))
             self._parsers[flow.id] = parser
             # Attach a streaming transformer so we see chunks in real time
             flow.response.stream = _make_stream_transformer(parser)
@@ -204,6 +211,7 @@ class CIAAddon:
                     meta={"flow_id": flow.id, "path": flow.request.path,
                           "category": info["category"],
                           "purpose": info["purpose"],
+                          "request_id": _request_id(flow),
                           "body": body[:500]},
                 ))
             else:
@@ -271,10 +279,13 @@ class CIAAddon:
         elif endpoint == _MESSAGES_PATH:
             usage = body.get("usage") or {}
             model = body.get("model") or info.get("model")
+            rid = _request_id(flow)
             meta = {"flow_id": flow.id, "streaming": False,
                     "message_id": body.get("id", ""),
                     "cache_read_input_tokens": usage.get("cache_read_input_tokens", 0) or 0,
                     "cache_creation_input_tokens": usage.get("cache_creation_input_tokens", 0) or 0}
+            if rid:
+                meta["request_id"] = rid
             if info.get("anatomy"):
                 meta["request"] = info["anatomy"]
             self._emit(Event(
@@ -293,7 +304,8 @@ class CIAAddon:
                 tokens_output=usage.get("output_tokens"),
                 meta={"flow_id": flow.id, "streaming": False,
                       "stop_reason": body.get("stop_reason"),
-                      "usage": usage},
+                      "usage": usage,
+                      **({"request_id": rid} if rid else {})},
             ))
 
 

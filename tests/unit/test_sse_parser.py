@@ -413,3 +413,26 @@ class TestThinkingCapture:
         end = next(e for e in events if e.phase is Phase.API_THINKING_END)
         assert end.meta["thinking_sample"] == "abcdefghij"   # capped at 10
         assert end.meta["thinking_sample_truncated"] is True
+
+
+class TestRequestId:
+    def test_request_id_lands_on_start_and_end(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.set_request_id("req_011abc")
+        p.feed(_sse(_message_start(), _block_start(0, "text"), _block_stop(0),
+                    _message_delta(), _message_stop()))
+        start = next(e for e in events if e.phase is Phase.API_REQUEST_START)
+        end = next(e for e in events if e.phase is Phase.API_RESPONSE_END)
+        assert start.meta["request_id"] == "req_011abc"
+        assert end.meta["request_id"] == "req_011abc"
+
+    def test_missing_request_id_leaves_meta_clean(self):
+        p, events = _parser()
+        p.set_request_start(time.time())
+        p.set_request_id(None)
+        p.feed(_sse(_message_start(), _message_stop()))
+        start = next(e for e in events if e.phase is Phase.API_REQUEST_START)
+        end = next(e for e in events if e.phase is Phase.API_RESPONSE_END)
+        assert "request_id" not in start.meta
+        assert "request_id" not in end.meta

@@ -86,6 +86,32 @@ class TestClear:
         assert await store.count() == 0
 
 
+class TestBackup:
+    async def test_backup_copies_db_and_jsonl(self, store, tmp_path):
+        await _add_events(store, [Phase.SESSION_START, Phase.SESSION_END])
+        dest = tmp_path / "snap"
+        info = await store.backup(dest)
+
+        assert info["events"] == 2
+        assert Path(info["db"]).exists()
+        assert Path(info["jsonl"]).exists()
+
+        # The backed-up DB is a consistent SQLite copy holding both events.
+        restored = Store(Path(info["db"]))
+        await restored.open()
+        assert await restored.count() == 2
+        await restored.close()
+
+    async def test_backup_survives_without_jsonl(self, tmp_path):
+        s = Store(tmp_path / "noj.db", jsonl_path=None)
+        await s.open()
+        await _add_events(s, [Phase.SESSION_START])
+        info = await s.backup(tmp_path / "snap")
+        assert info["events"] == 1
+        assert "jsonl" not in info
+        await s.close()
+
+
 class TestExport:
     async def test_export_jsonl(self, store):
         import json

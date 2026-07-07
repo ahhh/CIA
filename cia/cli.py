@@ -38,13 +38,26 @@ console = Console()
 # Socket helpers                                                       #
 # ------------------------------------------------------------------ #
 
+def _clear_stale_socket() -> None:
+    """Remove socket/pid files left behind by a daemon that died uncleanly."""
+    SOCKET_PATH.unlink(missing_ok=True)
+    PID_FILE.unlink(missing_ok=True)
+
+
 def _send(cmd: dict) -> dict:
     if not SOCKET_PATH.exists():
         console.print("[red]CIA daemon not running. Run: cia start[/red]")
         sys.exit(1)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock.connect(str(SOCKET_PATH))
+        try:
+            sock.connect(str(SOCKET_PATH))
+        except (ConnectionRefusedError, FileNotFoundError):
+            # Socket file exists but nobody is listening — stale leftover.
+            _clear_stale_socket()
+            console.print("[red]CIA daemon not running (cleared stale socket). "
+                          "Run: cia start[/red]")
+            sys.exit(1)
         sock.sendall(json.dumps(cmd).encode() + b"\n")
         buf = b""
         while True:
@@ -155,10 +168,11 @@ def _run_daemon(kwargs: dict) -> None:
 # ------------------------------------------------------------------ #
 
 def _build_run_env(proxy_port: int = 8080, otlp_port: int = 4318,
-                   cert: Path | None = None) -> dict:
+                   cert: Path | None = None, detail: bool = False,
+                   trace: bool = False) -> dict:
     """Env vars that route a child process through CIA's collectors."""
     cert = cert or Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
-    return {
+    env = {
         # Route HTTPS through the mitmproxy collector
         "HTTPS_PROXY": f"http://127.0.0.1:{proxy_port}",
         "NODE_EXTRA_CA_CERTS": str(cert),
@@ -168,16 +182,37 @@ def _build_run_env(proxy_port: int = 8080, otlp_port: int = 4318,
         "OTEL_LOGS_EXPORTER": "otlp",
         "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
         "OTEL_EXPORTER_OTLP_ENDPOINT": f"http://127.0.0.1:{otlp_port}",
-        "OTEL_METRIC_EXPORT_INTERVAL": "10000",
-        "OTEL_LOGS_EXPORT_INTERVAL": "5000",
+        # Local export is cheap — tight intervals shrink the lag between
+        # work happening and its metrics landing (turn attribution error).
+        "OTEL_METRIC_EXPORT_INTERVAL": "2000",
+        "OTEL_LOGS_EXPORT_INTERVAL": "2000",
+        # Ask for delta counters so per-export increments arrive as-is
+        # instead of being reconstructed from cumulative totals.
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
     }
+    if detail:
+        # Opt-in: full tool parameters/errors, real MCP server names, hook
+        # matchers, refusal categories.  Off by default — can be sensitive.
+        env["OTEL_LOG_TOOL_DETAILS"] = "1"
+    if trace:
+        # Opt-in: Claude Code's beta span tracing → /v1/traces (otel_span
+        # events), its own internal timing structure.
+        env["CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"] = "1"
+        env["OTEL_TRACES_EXPORTER"] = "otlp"
+        env["OTEL_TRACES_EXPORT_INTERVAL"] = "2000"
+    return env
 
 
 @main.command(context_settings={"ignore_unknown_options": True})
 @click.option("--proxy-port", default=8080, show_default=True)
 @click.option("--otlp-port",  default=4318, show_default=True)
+@click.option("--detail", is_flag=True,
+              help="Include tool parameters, full error messages and real "
+                   "MCP/hook names in native telemetry (OTEL_LOG_TOOL_DETAILS)")
+@click.option("--trace", is_flag=True,
+              help="Enable Claude Code's beta span tracing (otel_span events)")
 @click.argument("command", nargs=-1, type=click.UNPROCESSED)
-def run(proxy_port, otlp_port, command):
+def run(proxy_port, otlp_port, detail, trace, command):
     """Launch a command (default: claude) fully wired into CIA.
 
     Sets HTTPS_PROXY + the mitmproxy CA cert so API traffic is captured,
@@ -186,6 +221,7 @@ def run(proxy_port, otlp_port, command):
 
         cia run claude
         cia run -- claude --continue
+        cia run --detail --trace claude
     """
     argv = list(command) or ["claude"]
     cert = Path.home() / ".mitmproxy" / "mitmproxy-ca-cert.pem"
@@ -198,9 +234,11 @@ def run(proxy_port, otlp_port, command):
                       "once to generate it, and 'cia trust-cert'.[/yellow]")
 
     env = dict(os.environ)
-    env.update(_build_run_env(proxy_port, otlp_port, cert))
+    env.update(_build_run_env(proxy_port, otlp_port, cert, detail, trace))
+    flags = "".join(f", {f}" for f, on in
+                    (("detail", detail), ("trace", trace)) if on)
     console.print(f"[green]cia run:[/green] [cyan]{' '.join(argv)}[/cyan] "
-                  f"[dim](proxy :{proxy_port}, otlp :{otlp_port})[/dim]")
+                  f"[dim](proxy :{proxy_port}, otlp :{otlp_port}{flags})[/dim]")
     try:
         os.execvpe(argv[0], argv, env)
     except FileNotFoundError:
@@ -212,17 +250,82 @@ def run(proxy_port, otlp_port, command):
 # stop                                                                 #
 # ------------------------------------------------------------------ #
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by someone else.
+        return True
+    return True
+
+
+def _read_pid() -> int | None:
+    try:
+        return int(PID_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _stop_via_pid() -> bool:
+    """Fall back to signalling the daemon by PID. Returns True if a live
+    process was found and terminated."""
+    pid = _read_pid()
+    if pid is None or not _pid_alive(pid):
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    # Wait for graceful exit, then escalate to SIGKILL.
+    for _ in range(30):
+        if not _pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return True
+
+
 @main.command()
 def stop():
     """Stop the CIA daemon."""
-    result = _require_ok(_send({"cmd": "stop"}))
-    # Wait for socket to disappear
-    for _ in range(20):
-        if not SOCKET_PATH.exists():
-            break
-        time.sleep(0.1)
-    PID_FILE.unlink(missing_ok=True)
-    console.print("[green]CIA daemon stopped.[/green]")
+    asked_socket = False
+    # Try the clean path: ask the daemon over its socket.
+    if SOCKET_PATH.exists():
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(str(SOCKET_PATH))
+            sock.sendall(json.dumps({"cmd": "stop"}).encode() + b"\n")
+            asked_socket = True
+        except (ConnectionRefusedError, FileNotFoundError):
+            pass  # Stale socket — fall through to PID-based stop.
+        finally:
+            sock.close()
+
+    if asked_socket:
+        # Wait for the daemon to tear down its own socket.
+        for _ in range(20):
+            if not SOCKET_PATH.exists():
+                break
+            time.sleep(0.1)
+
+    # If the socket is still around (or the daemon never answered), make sure
+    # the process is actually gone.
+    killed = False
+    if not asked_socket or SOCKET_PATH.exists():
+        killed = _stop_via_pid()
+
+    _clear_stale_socket()
+
+    if asked_socket or killed:
+        console.print("[green]CIA daemon stopped.[/green]")
+    else:
+        console.print("[yellow]CIA daemon was not running "
+                      "(cleaned up stale files).[/yellow]")
 
 
 # ------------------------------------------------------------------ #
@@ -386,6 +489,16 @@ def _event_extra(evt: dict) -> str:
                 parts.append(f"{k}={meta['attributes'][k]}")
     if phase == "otel_event":
         parts.append(str(meta.get("name")))
+        attrs = meta.get("attributes") or {}
+        for key in _OTEL_TAIL_FIELDS.get(meta.get("name"), ()):
+            if attrs.get(key) is not None:
+                val = attrs[key]
+                val = f"{val:.4f}" if isinstance(val, float) else val
+                parts.append(f"{key.split('.')[-1]}={val}")
+    if phase == "otel_span":
+        parts.append(str(meta.get("name")))
+        if meta.get("parent_span_id"):
+            parts.append(f"parent={str(meta['parent_span_id'])[:8]}")
     tr = meta.get("tool_result") or {}
     if tr:
         if tr.get("is_error"):
@@ -432,6 +545,31 @@ def _event_extra(evt: dict) -> str:
 
     # escape: parts are data and may contain [...] that Rich would eat as markup
     return ("  [dim]" + escape(" ".join(parts)) + "[/dim]") if parts else ""
+
+
+# Per-event-name attribute picks for the tail line — the fields that make a
+# native telemetry event readable at a glance.
+_OTEL_TAIL_FIELDS = {
+    "api_request": ("model", "query_source", "duration_ms", "cost_usd",
+                    "input_tokens", "output_tokens", "request_id"),
+    "api_error": ("model", "status_code", "attempt", "error"),
+    "api_retries_exhausted": ("status_code", "total_attempts",
+                              "total_retry_duration_ms"),
+    "api_refusal": ("model", "category", "server_fallback_hop"),
+    "tool_decision": ("tool_name", "decision", "source"),
+    "tool_result": ("tool_name", "success", "duration_ms", "error_type"),
+    "permission_mode_changed": ("from_mode", "to_mode", "trigger"),
+    "mcp_server_connection": ("server_name", "status", "transport_type",
+                              "duration_ms", "error_code"),
+    "compaction": ("trigger", "success", "duration_ms", "pre_tokens",
+                   "post_tokens"),
+    "skill_activated": ("skill.name", "invocation_trigger"),
+    "at_mention": ("mention_type", "success"),
+    "internal_error": ("error_name", "error_code"),
+    "auth": ("action", "success", "auth_method"),
+    "hook_execution_complete": ("hook_name", "total_duration_ms",
+                                "num_blocking"),
+}
 
 
 def _strip_query(path: str) -> str:
@@ -499,9 +637,31 @@ def _phase_colour(phase: str) -> str:
 @click.option("--input", "input_file", default=None, type=click.Path(exists=True),
               help="Read events from a JSONL file instead of the daemon")
 @click.option("--json", "as_json", is_flag=True, help="Emit raw JSON instead of tables")
-def report(session, since, input_file, as_json):
-    """Derived performance report: turns, tools, human latency, compactions, rework."""
+@click.option("--backup", "backup_dir", is_flag=False, flag_value="__default__",
+              default=None, type=click.Path(),
+              help="Snapshot all report data (SQLite + JSONL) to a directory "
+                   "(default: ~/.cia/backups/<timestamp>/) and exit")
+@click.option("--reset", is_flag=True,
+              help="Delete all recorded events, resetting the report to empty")
+@click.option("--yes", "-y", is_flag=True, help="Skip the --reset confirmation prompt")
+@click.option("--no-transcripts", is_flag=True,
+              help="Skip reading Claude Code's on-disk session transcripts "
+                   "and /insights usage-data")
+def report(session, since, input_file, as_json, backup_dir, reset, yes,
+           no_transcripts):
+    """Derived performance report: turns, tools, human latency, compactions, rework.
+
+    With --backup, snapshot the underlying event store instead of reporting.
+    With --reset, wipe it. Combine them to back up before resetting.
+    """
     from cia.analytics import full_report
+
+    if backup_dir is not None:
+        _report_backup(backup_dir)
+    if reset:
+        _report_reset(yes)
+    if backup_dir is not None or reset:
+        return
 
     events = _load_events(input_file, since)
     if session:
@@ -511,7 +671,7 @@ def report(session, since, input_file, as_json):
         console.print("[yellow]No events found.[/yellow]")
         return
 
-    data = full_report(events)
+    data = full_report(events, use_transcripts=not no_transcripts)
     if as_json:
         print(json.dumps(data, indent=2))
         return
@@ -529,6 +689,38 @@ def report(session, since, input_file, as_json):
     _render_cost(data["cost"])
     _render_throughput(data["throughput"])
     _render_network(data["network"])
+    _render_otel(data["otel"])
+    _render_transcripts(data["transcripts"])
+
+
+def _report_backup(backup_dir: str) -> None:
+    """Snapshot the daemon's event store (SQLite + JSONL) to a directory."""
+    if backup_dir == "__default__":
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = CIA_DIR / "backups" / stamp
+    else:
+        dest = Path(backup_dir)
+    dest = dest.expanduser().resolve()
+
+    result = _require_ok(_send({"cmd": "backup", "dir": str(dest)}))
+    console.print(f"[green]Backed up {result.get('events', 0)} events → "
+                  f"{result.get('dir', dest)}[/green]")
+    console.print(f"  SQLite : [cyan]{result.get('db', '-')}[/cyan]")
+    if result.get("jsonl"):
+        console.print(f"  JSONL  : [cyan]{result['jsonl']}[/cyan]")
+
+
+def _report_reset(assume_yes: bool) -> None:
+    """Wipe all recorded events so the report starts from empty."""
+    count = _require_ok(_send({"cmd": "status"})).get("events", 0)
+    if not assume_yes and not click.confirm(
+        f"Delete all {count} recorded event(s)? This cannot be undone "
+        f"(use 'cia report --backup' first to keep a copy)"
+    ):
+        console.print("[yellow]Reset cancelled.[/yellow]")
+        return
+    _require_ok(_send({"cmd": "clear"}))
+    console.print(f"[green]Report reset — {count} event(s) cleared.[/green]")
 
 
 def _load_events(input_file, since):
@@ -561,6 +753,7 @@ def _render_sessions(stories: list) -> None:
     for col in ("session", "started", "dur", "turns", "api", "tok in/out",
                 "think s", "tools", "wait s", "coverage"):
         t.add_column(col, justify="right" if col not in ("session", "started", "coverage") else "left")
+    t.add_column("title", no_wrap=True, overflow="ellipsis", max_width=26)
     for s in stories:
         mins, secs = divmod(int(s["duration_s"]), 60)
         cov = "".join(
@@ -568,21 +761,28 @@ def _render_sessions(stories: list) -> None:
             for k, v in s["coverage"].items()
         )
         turns = str(s["turns"]) + (f"+{s['incomplete_turns']}*" if s["incomplete_turns"] else "")
+        tok_mark = "†" if s.get("token_source") == "transcript" else ""
+        title = escape(s.get("title") or "")
+        if s.get("project"):
+            proj = f"[dim]({escape(s['project'])})[/dim]"
+            title = f"{title} {proj}" if title else proj
         t.add_row(
             s["session_id"][:8],
             time.strftime("%m-%d %H:%M", time.localtime(s["start_ts"])),
             f"{mins}m{secs:02d}s",
             turns, str(s["api_calls"]),
-            f"{s['tokens_input']}/{s['tokens_output']}",
+            f"{s['tokens_input']}/{s['tokens_output']}{tok_mark}",
             f"{s['thinking_ms']/1000:.1f}",
             f"{s['tool_calls']}" + (f" ({s['tool_errors']}E)" if s["tool_errors"] else ""),
             f"{s['permission_wait_s'] + s['think_time_s']:.0f}",
             cov,
+            title,
         )
     console.print(t)
-    console.print("[dim]coverage: H=hooks P=proxy F=fswatch "
+    console.print("[dim]coverage: H=hooks P=proxy F=fswatch T=transcript "
                   "([green]green[/green]=data present, [red]red[/red]=missing); "
-                  "* = turn still open at capture end[/dim]")
+                  "* = turn still open at capture end; "
+                  "† = tokens from the on-disk transcript (session not proxied)[/dim]")
     seen = set()
     for s in stories:
         for gap in s["gaps"]:
@@ -651,23 +851,45 @@ def _render_human(human: dict) -> None:
             f"{s['max_s']:.1f}" if s["count"] else "-",
         )
     console.print(t)
+    active = human.get("native_active_time")
+    if active:
+        console.print(f"[dim]Claude Code's own active-time split: "
+                      f"user {active['user_s']:.0f}s at the keyboard, "
+                      f"cli {active['cli_s']:.0f}s working[/dim]")
 
 
 def _render_compactions(compactions: list) -> None:
     if not compactions:
         return
     t = Table(title="Compaction cost", show_header=True, header_style="bold cyan")
-    for col in ("time", "trigger", "ctx before", "ctx after", "reclaimed", "recovery s"):
+    for col in ("time", "trigger", "ctx before", "ctx after", "reclaimed",
+                "recovery s", "native"):
         t.add_column(col, justify="right" if "ctx" in col or col == "reclaimed" else "left")
     for c in compactions:
+        native = c.get("native")
+        if native:
+            native_str = ("[red]FAILED[/red]" if not native["success"]
+                          else f"{native['duration_ms']/1000:.1f}s"
+                          if native["duration_ms"] is not None else "ok")
+        else:
+            native_str = "-"
         t.add_row(
             time.strftime("%H:%M:%S", time.localtime(c["ts"])),
             c["trigger"] or "-",
-            str(c["context_before"] or "-"), str(c["context_after"] or "-"),
-            str(c["reclaimed_tokens"] or "-"),
+            _fmt_tok(c["context_before"]), _fmt_tok(c["context_after"]),
+            _fmt_tok(c["reclaimed_tokens"]),
             f"{c['recovery_s']:.1f}" if c["recovery_s"] is not None else "-",
+            native_str,
         )
     console.print(t)
+    if any(c.get("native") for c in compactions):
+        console.print("[dim]native = Claude Code's own compaction event "
+                      "(exact pre/post tokens, duration); rows without a "
+                      "PreCompact hook come from native telemetry alone[/dim]")
+
+
+def _fmt_tok(v) -> str:
+    return f"{int(v):,}" if v is not None else "-"
 
 
 def _render_rework(files: list) -> None:
@@ -867,7 +1089,7 @@ def _render_cost(cost: dict) -> None:
         console.print(tt)
     console.print("[dim]costs from Claude Code's own telemetry, attributed to "
                   "the most recent turn started before each metric export "
-                  "(~10s granularity)[/dim]")
+                  "(2s granularity under cia run)[/dim]")
 
 
 def _render_throughput(tp: dict) -> None:
@@ -934,6 +1156,173 @@ def _render_network(net: dict) -> None:
         console.print(f"  [red]{fail['status'] or 'ERR'}[/red] "
                       f"{escape(fail['host'] + _strip_query(fail['path'] or ''))} "
                       f"[dim][{fail['category']}][/dim]{during}")
+
+
+def _render_otel(otel: dict) -> None:
+    """Sections derived from Claude Code's own telemetry (cia run only)."""
+    if not otel["available"]:
+        return
+
+    perm = otel["permissions"]
+    if perm["decisions"]:
+        console.print("[bold cyan]Permission economics (native telemetry)[/bold cyan]")
+        auto = (f"{perm['auto_rate']*100:.0f}%"
+                if perm["auto_rate"] is not None else "-")
+        console.print(
+            f"  {perm['decisions']} decision(s): {perm['accepts']} accepted / "
+            f"{perm['rejects']} rejected; {perm['auto_approved']} auto-approved "
+            f"({auto}) by config/hooks")
+        srcs = ", ".join(f"{k} ×{v}" for k, v in
+                         sorted(perm["by_source"].items(), key=lambda kv: -kv[1]))
+        console.print(f"  by source: [dim]{escape(srcs)}[/dim]")
+        rejected = {k: v for k, v in perm["by_tool"].items() if v["rejects"]}
+        if rejected:
+            rej = ", ".join(f"{k} ×{v['rejects']}" for k, v in
+                            sorted(rejected.items(), key=lambda kv: -kv[1]["rejects"]))
+            console.print(f"  rejections by tool: [red]{escape(rej)}[/red]")
+
+    rel = otel["api_reliability"]
+    if rel["available"]:
+        console.print("[bold cyan]API reliability (native telemetry)[/bold cyan]")
+        if rel["errors"]:
+            statuses = ", ".join(f"{k} ×{v}" for k, v in
+                                 sorted(rel["errors_by_status"].items()))
+            console.print(f"  {rel['errors']} API error(s) "
+                          f"({escape(statuses)}), {rel['error_ms']/1000:.1f}s "
+                          f"spent in failed attempts")
+        for x in rel["retries_exhausted"]:
+            attempts = int(x["total_attempts"] or 0)
+            console.print(f"  [red]retries exhausted[/red] at "
+                          f"{time.strftime('%H:%M:%S', time.localtime(x['ts']))}: "
+                          f"{attempts} attempt(s), "
+                          f"{(x['retry_ms'] or 0)/1000:.1f}s lost "
+                          f"({x['model'] or '?'})")
+        for r in rel["refusals"]:
+            cat = f" category={r['category']}" if r.get("category") else ""
+            console.print(f"  [red]refusal[/red] at "
+                          f"{time.strftime('%H:%M:%S', time.localtime(r['ts']))} "
+                          f"({r['model'] or '?'}){escape(cat)}")
+
+    sub = otel["subsystems"]
+    if sub["available"]:
+        t = Table(title="Cost by subsystem (native telemetry)",
+                  show_header=True, header_style="bold cyan")
+        for col in ("query source", "req", "cost", "tok in/out", "cache read", "api s"):
+            t.add_column(col, justify="right" if col != "query source" else "left")
+        for qs, g in sorted(otel["subsystems"]["by_query_source"].items(),
+                            key=lambda kv: -kv[1]["cost_usd"]):
+            t.add_row(
+                qs, str(g["requests"]), f"${g['cost_usd']:.4f}",
+                f"{g['input_tokens']:,}/{g['output_tokens']:,}",
+                f"{g['cache_read_tokens']:,}", f"{g['api_ms']/1000:.1f}",
+            )
+        console.print(t)
+        for key, groups in sub["attribution"].items():
+            line = ", ".join(f"{name}: ${g['cost_usd']:.4f} ({g['requests']} req)"
+                             for name, g in sorted(groups.items(),
+                                                   key=lambda kv: -kv[1]["cost_usd"]))
+            console.print(f"  by {key}: [dim]{escape(line)}[/dim]")
+
+    hooks = otel["hooks"]
+    if hooks["hooks"]:
+        t = Table(title="Hook overhead (native telemetry)",
+                  show_header=True, header_style="bold cyan")
+        for col in ("hook", "runs", "total s", "p50 ms", "max ms", "blocking", "err"):
+            t.add_column(col, justify="right" if col != "hook" else "left")
+        for h in hooks["hooks"]:
+            t.add_row(
+                h["hook"], str(h["runs"]), f"{h['total_ms']/1000:.1f}",
+                f"{h['p50_ms']:.0f}" if h["p50_ms"] is not None else "-",
+                f"{h['max_ms']:.0f}" if h["max_ms"] is not None else "-",
+                str(h["blocking"]) if h["blocking"] else "-",
+                str(h["errors"]) if h["errors"] else "-",
+            )
+        console.print(t)
+        console.print("[dim]includes CIA's own instrumentation hooks — this "
+                      "is what observing the session costs it[/dim]")
+
+    mcp = otel["mcp"]
+    if mcp["attempts"]:
+        statuses = ", ".join(f"{k} ×{v}" for k, v in sorted(mcp["by_status"].items()))
+        c = mcp["connect_ms"]
+        timing = (f"; connect p50 {c['p50']:.0f}ms, max {c['max']:.0f}ms"
+                  if c["count"] else "")
+        console.print(f"[bold cyan]MCP connections (native telemetry)[/bold cyan]")
+        console.print(f"  {escape(statuses)}{timing}")
+        for f in mcp["failures"][:5]:
+            server = f["server"] or "server name redacted — rerun with cia run --detail"
+            console.print(f"  [red]failed[/red]: {escape(str(server))} "
+                          f"[dim]({f['transport'] or '?'}, "
+                          f"code {f['error_code'] or '?'})[/dim]")
+
+    err = otel["errors"]
+    if err["internal_errors"] or err["auth_failures"]:
+        console.print("[bold cyan]Client health (native telemetry)[/bold cyan]")
+        for name, n in sorted(err["internal_errors"].items(), key=lambda kv: -kv[1]):
+            console.print(f"  internal error {escape(name)} ×{n}")
+        if err["auth_failures"]:
+            console.print(f"  [red]{err['auth_failures']} auth failure(s)[/red]")
+
+    if otel["session_starts"]:
+        line = ", ".join(f"{k}: {v}" for k, v in otel["session_starts"].items())
+        console.print(f"[dim]session starts by type: {escape(line)}[/dim]")
+
+
+def _render_transcripts(tr: dict) -> None:
+    """Sections derived from on-disk transcripts + /insights usage-data."""
+    if not tr["available"]:
+        return
+
+    subs = tr["subagent_economics"]
+    if subs:
+        t = Table(title="Subagent economics (transcripts)",
+                  show_header=True, header_style="bold cyan")
+        for col in ("agent type", "runs", "tok out", "tok in", "cache read",
+                    "tool calls"):
+            t.add_column(col, justify="right" if col != "agent type" else "left")
+        for name, g in sorted(subs.items(),
+                              key=lambda kv: -kv[1]["output_tokens"]):
+            t.add_row(
+                name, str(g["runs"]), f"{g['output_tokens']:,}",
+                f"{g['input_tokens']:,}", f"{g['cache_read_tokens']:,}",
+                str(g["tool_calls"]),
+            )
+        console.print(t)
+
+    delivered = [(sid, s) for sid, s in tr["sessions"].items()
+                 if s.get("insights")]
+    for sid, s in delivered:
+        ins = s["insights"]
+        bits = []
+        if ins.get("lines_added") is not None or ins.get("lines_removed") is not None:
+            bits.append(f"+{ins.get('lines_added') or 0}/"
+                        f"-{ins.get('lines_removed') or 0} lines")
+        if ins.get("files_modified"):
+            bits.append(f"{ins['files_modified']} file(s)")
+        if ins.get("git_commits"):
+            bits.append(f"{ins['git_commits']} commit(s)")
+        if ins.get("outcome"):
+            bits.append(f"outcome: {ins['outcome']}")
+        if bits:
+            console.print(f"  [cyan]{sid[:8]}[/cyan] delivered "
+                          f"[dim]{escape(', '.join(str(b) for b in bits))}[/dim]")
+
+    disagreements = [
+        (sid, s["agreement"]) for sid, s in tr["sessions"].items()
+        if (s["agreement"]["disagreement_frac"] or 0) > 0.05
+    ]
+    if disagreements:
+        console.print("[bold cyan]Source agreement — output tokens[/bold cyan]")
+        for sid, a in disagreements:
+            src = ", ".join(f"{k}={int(v):,}" for k, v in
+                            a["output_tokens"].items() if v)
+            console.print(f"  [yellow]{sid[:8]}[/yellow] sources disagree by "
+                          f"{a['disagreement_frac']*100:.0f}%: "
+                          f"[dim]{escape(src)}[/dim]")
+        console.print("[dim]transcript = usage saved in the session transcript "
+                      "(ground truth for what Claude Code was billed); "
+                      "divergence usually means partial proxy/telemetry "
+                      "coverage of the session[/dim]")
 
 
 # ------------------------------------------------------------------ #

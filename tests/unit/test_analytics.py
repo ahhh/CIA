@@ -301,7 +301,8 @@ def test_session_story_aggregates_and_full_coverage():
     assert s["tool_calls"] == 1 and s["tool_errors"] == 1 and s["edits"] == 1
     assert s["ended"] is True and s["end_reason"] == "exit"
     assert s["models"] == ["m"]
-    assert s["coverage"] == {"hooks": True, "proxy": True, "fswatch": True}
+    assert s["coverage"] == {"hooks": True, "proxy": True, "fswatch": True,
+                             "transcripts": False}
     assert s["gaps"] == []
 
 
@@ -326,7 +327,8 @@ def test_full_report_shape():
     report = full_report(events)
     assert set(report) == {"sessions", "turns", "tools", "chains", "human",
                            "compactions", "rework", "cache", "thinking",
-                           "context", "cost", "throughput", "network"}
+                           "context", "cost", "throughput", "network", "otel",
+                           "transcripts"}
     assert len(report["turns"]) == 1
     assert report["tools"][0]["tool"] == "Bash"
 
@@ -666,3 +668,331 @@ def test_network_overhead_categories_totals_and_failures():
     assert abs(tot["overhead_time_frac"] - 300 / 4300) < 1e-9
     assert len(net["failures"]) == 1
     assert net["failures"][0]["during_api_call"] is True   # inside f1's window
+
+
+# ------------------------------------------------------------------ #
+# request-id join / exact session attribution                          #
+# ------------------------------------------------------------------ #
+
+import pytest  # noqa: E402
+
+from cia.analytics import api_flow_sessions, otel_insights  # noqa: E402
+
+SID_B = "sess-2"
+
+
+def _otel_api_request(ts: float, session_id: str, request_id: str,
+                      **attrs) -> Event:
+    return E(Phase.OTEL_EVENT, ts, session_id=session_id,
+             meta={"name": "api_request",
+                   "attributes": {"request_id": request_id,
+                                  "session.id": session_id, **attrs}})
+
+
+def _proxied_api_call(ts: float, flow_id: str, request_id: str,
+                      dur: float = 2.0) -> list[Event]:
+    return [
+        E(Phase.API_REQUEST_START, ts, model="m", tokens_input=100,
+          meta={"flow_id": flow_id, "request_id": request_id,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0}),
+        E(Phase.API_RESPONSE_END, ts + dur, model="m", duration_ms=dur * 1000,
+          tokens_input=100, tokens_output=10,
+          meta={"flow_id": flow_id, "request_id": request_id}),
+    ]
+
+
+def test_api_flow_sessions_joins_via_request_id():
+    events = (
+        _proxied_api_call(1, "f1", "req_a")
+        + _proxied_api_call(2, "f2", "req_b")
+        + [_otel_api_request(3, SID, "req_a"),
+           _otel_api_request(4, SID_B, "req_b")]
+    )
+    assert api_flow_sessions(events) == {"f1": SID, "f2": SID_B}
+
+
+def test_concurrent_sessions_attribute_api_events_exactly():
+    # Two sessions with fully overlapping turns; each made one API call.
+    events = (
+        [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "a"}),
+         E(Phase.USER_PROMPT, 0.5, session_id=SID_B, meta={"prompt": "b"})]
+        + _proxied_api_call(1, "f1", "req_a", dur=2.0)
+        + _proxied_api_call(1.5, "f2", "req_b", dur=4.0)
+        + [_otel_api_request(3, SID, "req_a"),
+           _otel_api_request(5.5, SID_B, "req_b"),
+           E(Phase.TURN_END, 10, session_id=SID),
+           E(Phase.TURN_END, 10.5, session_id=SID_B)]
+    )
+    turns = {t["session_id"]: t for t in turn_anatomy(events)}
+    # With the join, each turn sees only its own API call — the pure
+    # time-window fallback would have counted both in both turns.
+    assert turns[SID]["api_calls"] == 1
+    assert turns[SID]["api_ms"] == 2000
+    assert turns[SID_B]["api_calls"] == 1
+    assert turns[SID_B]["api_ms"] == 4000
+
+
+def test_unjoined_flows_fall_back_to_time_window():
+    events = (
+        [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "a"})]
+        + _proxied_api_call(1, "f1", "req_a")     # no otel join available
+        + [E(Phase.TURN_END, 10, session_id=SID)]
+    )
+    turns = turn_anatomy(events)
+    assert turns[0]["api_calls"] == 1
+
+
+# ------------------------------------------------------------------ #
+# metric temporality                                                   #
+# ------------------------------------------------------------------ #
+
+def _cost_metric(ts: float, value: float, temporality: str | None = None,
+                 session_id: str = SID) -> Event:
+    meta = {"name": "claude_code.cost.usage", "value": value, "unit": "USD",
+            "attributes": {"session.id": session_id}}
+    if temporality:
+        meta["temporality"] = temporality
+    return E(Phase.OTEL_METRIC, ts, session_id=session_id, meta=meta)
+
+
+def test_delta_temporality_prevents_false_differencing():
+    # An increasing *delta* series: the heuristic alone would difference it
+    # (0.001 + 0.001 = 0.002); the recorded temporality keeps it as-is.
+    base = [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "x"}),
+            E(Phase.TURN_END, 60, session_id=SID)]
+    deltas = [_cost_metric(10, 0.001, "delta"), _cost_metric(20, 0.002, "delta")]
+    cost = cost_attribution(base + deltas)
+    assert cost["total_cost_usd"] == pytest.approx(0.003)
+
+    cumulative = [_cost_metric(10, 0.001, "cumulative"),
+                  _cost_metric(20, 0.002, "cumulative")]
+    cost = cost_attribution(base + cumulative)
+    assert cost["total_cost_usd"] == pytest.approx(0.002)
+
+    unknown = [_cost_metric(10, 0.001), _cost_metric(20, 0.002)]
+    cost = cost_attribution(base + unknown)     # heuristic fallback
+    assert cost["total_cost_usd"] == pytest.approx(0.002)
+
+
+# ------------------------------------------------------------------ #
+# otel_insights                                                        #
+# ------------------------------------------------------------------ #
+
+def _otel(ts: float, name: str, **attrs) -> Event:
+    return E(Phase.OTEL_EVENT, ts, session_id=SID,
+             meta={"name": name, "attributes": attrs})
+
+
+def test_otel_insights_unavailable_without_telemetry():
+    events = [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "x"})]
+    assert otel_insights(events)["available"] is False
+
+
+def test_permission_economics_counts_sources_and_rejections():
+    events = [
+        _otel(1, "tool_decision", tool_name="Edit", decision="accept",
+              source="config"),
+        _otel(2, "tool_decision", tool_name="Edit", decision="accept",
+              source="user_temporary"),
+        _otel(3, "tool_decision", tool_name="Bash", decision="reject",
+              source="user_reject"),
+    ]
+    perm = otel_insights(events)["permissions"]
+    assert perm["decisions"] == 3
+    assert perm["accepts"] == 2 and perm["rejects"] == 1
+    assert perm["auto_approved"] == 1
+    assert perm["by_source"]["user_reject"] == 1
+    assert perm["by_tool"]["Bash"]["rejects"] == 1
+
+
+def test_api_reliability_aggregates_errors_retries_refusals():
+    events = [
+        _otel(1, "api_error", model="m", status_code=529, attempt=1,
+              duration_ms=1200, error="overloaded"),
+        _otel(2, "api_error", model="m", status_code=529, attempt=2,
+              duration_ms=1800, error="overloaded"),
+        _otel(3, "api_retries_exhausted", model="m", status_code=529,
+              total_attempts=5, total_retry_duration_ms=30000),
+        _otel(4, "api_refusal", model="m", category="cyber"),
+    ]
+    rel = otel_insights(events)["api_reliability"]
+    assert rel["errors"] == 2
+    assert rel["errors_by_status"] == {"529": 2}
+    assert rel["error_ms"] == 3000
+    assert rel["retry_ms_lost"] == 30000
+    assert rel["refusals"][0]["category"] == "cyber"
+
+
+def test_cost_by_subsystem_splits_query_source_and_attribution():
+    events = [
+        _otel(1, "api_request", query_source="repl_main_thread",
+              cost_usd=0.02, input_tokens=1000, output_tokens=50,
+              cache_read_tokens=800, duration_ms=2000),
+        _otel(2, "api_request", query_source="subagent", cost_usd=0.01,
+              input_tokens=500, output_tokens=20, cache_read_tokens=0,
+              duration_ms=1000, **{"agent.name": "Explore"}),
+        _otel(3, "api_request", query_source="subagent", cost_usd=0.03,
+              input_tokens=700, output_tokens=30, cache_read_tokens=100,
+              duration_ms=1500, **{"agent.name": "Explore"}),
+    ]
+    sub = otel_insights(events)["subsystems"]
+    assert sub["requests"] == 3
+    main = sub["by_query_source"]["repl_main_thread"]
+    agents = sub["by_query_source"]["subagent"]
+    assert main["cost_usd"] == pytest.approx(0.02)
+    assert agents["requests"] == 2
+    assert agents["cost_usd"] == pytest.approx(0.04)
+    assert sub["attribution"]["agent.name"]["Explore"]["requests"] == 2
+
+
+def test_hook_overhead_and_mcp_health():
+    events = [
+        _otel(1, "hook_execution_complete", hook_name="PreToolUse:Bash",
+              total_duration_ms=120, num_blocking=1, num_non_blocking_error=0),
+        _otel(2, "hook_execution_complete", hook_name="PreToolUse:Bash",
+              total_duration_ms=80, num_blocking=0, num_non_blocking_error=1),
+        _otel(3, "mcp_server_connection", status="connected",
+              transport_type="stdio", duration_ms=250),
+        _otel(4, "mcp_server_connection", status="failed",
+              transport_type="http", duration_ms=5000, error_code="ETIMEDOUT"),
+    ]
+    insights = otel_insights(events)
+    hook = insights["hooks"]["hooks"][0]
+    assert hook["hook"] == "PreToolUse:Bash"
+    assert hook["runs"] == 2 and hook["total_ms"] == 200
+    assert hook["blocking"] == 1 and hook["errors"] == 1
+    mcp = insights["mcp"]
+    assert mcp["by_status"] == {"connected": 1, "failed": 1}
+    assert mcp["failures"][0]["error_code"] == "ETIMEDOUT"
+
+
+def test_session_starts_counts_distinct_sessions_per_type():
+    def start_metric(sid):
+        return Event(phase=Phase.OTEL_METRIC, ts=T0, session_id=sid,
+                     meta={"name": "claude_code.session.count", "value": 1,
+                           "attributes": {"start_type": "resume"}})
+    # cumulative counters re-export the same session id — counted once
+    events = [start_metric("s1"), start_metric("s1"), start_metric("s2")]
+    assert otel_insights(events)["session_starts"] == {"resume": 2}
+
+
+# ------------------------------------------------------------------ #
+# native compaction / active time enrichment                           #
+# ------------------------------------------------------------------ #
+
+def test_native_compaction_enriches_precompact_row():
+    events = [
+        E(Phase.CONTEXT_COMPACT, 100, session_id=SID,
+          meta={"trigger": "auto"}),
+        _otel(101, "compaction", trigger="auto", success="true",
+              duration_ms=4000, pre_tokens=150000, post_tokens=30000),
+    ]
+    rows = compaction_cost(events)
+    assert len(rows) == 1
+    assert rows[0]["native"]["duration_ms"] == 4000
+    assert rows[0]["reclaimed_tokens"] == 120000
+
+
+def test_native_only_compaction_becomes_own_row():
+    events = [_otel(500, "compaction", trigger="manual", success="false",
+                    duration_ms=900)]
+    rows = compaction_cost(events)
+    assert len(rows) == 1
+    assert rows[0]["trigger"] == "manual"
+    assert rows[0]["native"]["success"] is False
+
+
+def test_native_active_time_sums_deltas():
+    def active(ts, value, typ):
+        return Event(phase=Phase.OTEL_METRIC, ts=T0 + ts, session_id=SID,
+                     meta={"name": "claude_code.active_time.total",
+                           "value": value, "temporality": "cumulative",
+                           "attributes": {"type": typ}})
+    events = [active(1, 10, "user"), active(2, 25, "user"),
+              active(1, 5, "cli")]
+    hl = human_latency(events)
+    assert hl["native_active_time"] == {"user_s": 25.0, "cli_s": 5.0}
+
+
+# ------------------------------------------------------------------ #
+# transcript enrichment                                                #
+# ------------------------------------------------------------------ #
+
+from cia.analytics import transcript_insights  # noqa: E402
+
+
+def _fake_transcript(output=1000, subagents=()):
+    return {
+        "usage": {"input": 50, "output": output, "cache_read": 9000,
+                  "cache_creation": 100},
+        "by_model": {"claude-sonnet-4-6": {"input": 50, "output": output,
+                                           "cache_read": 9000,
+                                           "cache_creation": 100}},
+        "tool_counts": {"Bash": 3},
+        "prompts": [{"ts": T0, "text": "hi"}],
+        "title": "Fix the bug",
+        "project_path": "/Users/x/proj",
+        "first_ts": T0, "last_ts": T0 + 100,
+        "user_messages": 1, "assistant_messages": 2,
+        "subagents": list(subagents),
+    }
+
+
+def test_session_story_gap_fills_tokens_from_transcript():
+    events = [
+        E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "x"}),
+        E(Phase.TURN_END, 5, session_id=SID),
+    ]
+    transcripts = {SID: _fake_transcript(output=777)}
+    insights = {SID: {"outcome": "success"}}
+    story = session_stories(events, transcripts, insights)[0]
+    assert story["token_source"] == "transcript"
+    assert story["tokens_output"] == 777
+    assert story["models"] == ["claude-sonnet-4-6"]
+    assert story["title"] == "Fix the bug"
+    assert story["project"] == "x/proj"
+    assert story["outcome"] == "success"
+    assert story["coverage"]["transcripts"] is True
+    assert any("filled from the session transcript" in g for g in story["gaps"])
+
+
+def test_session_story_prefers_proxy_tokens_when_present():
+    events = (
+        [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "x"})]
+        + api_call(1, tokens_out=50)
+        + [E(Phase.TURN_END, 5, session_id=SID)]
+    )
+    story = session_stories(events, {SID: _fake_transcript(output=777)}, {})[0]
+    assert story["token_source"] == "proxy"
+    assert story["tokens_output"] == 50
+    assert story["title"] == "Fix the bug"    # identity still enriched
+
+
+def test_transcript_insights_subagent_economics_and_agreement():
+    sub = {"key": "agent-1.jsonl", "agent_type": "Explore",
+           "usage": {"input": 5, "output": 200, "cache_read": 100,
+                     "cache_creation": 0},
+           "tool_calls": 4, "tool_counts": {"Read": 4}}
+    events = (
+        [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "x"})]
+        + api_call(1, tokens_out=500)     # proxy sees only half the output
+        + [E(Phase.TURN_END, 5, session_id=SID)]
+    )
+    ti = transcript_insights(events,
+                             transcripts={SID: _fake_transcript(
+                                 output=1000, subagents=[sub])},
+                             insights={})
+    assert ti["available"]
+    econ = ti["subagent_economics"]["Explore"]
+    assert econ["runs"] == 1 and econ["output_tokens"] == 200
+    agree = ti["sessions"][SID]["agreement"]
+    assert agree["output_tokens"]["transcript"] == 1000
+    assert agree["output_tokens"]["proxy"] == 500
+    assert agree["disagreement_frac"] == 0.5
+
+
+def test_transcript_insights_unavailable_when_empty():
+    events = [E(Phase.USER_PROMPT, 0, session_id=SID, meta={"prompt": "x"})]
+    assert transcript_insights(events, transcripts={}, insights={}) \
+        == {"available": False}

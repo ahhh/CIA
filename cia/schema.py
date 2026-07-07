@@ -40,6 +40,7 @@ class Phase(str, Enum):
     # Claude Code native telemetry (OTLP receiver)
     OTEL_METRIC = "otel_metric"
     OTEL_EVENT  = "otel_event"
+    OTEL_SPAN   = "otel_span"     # beta span tracing (cia run --trace)
 
     # Session / agent lifecycle (from Claude Code hooks)
     PROCESS_SPAWN   = "process_spawn"

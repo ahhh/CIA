@@ -98,6 +98,37 @@ class Store:
         await self._db.commit()
 
     # ------------------------------------------------------------------ #
+    # Backup                                                               #
+    # ------------------------------------------------------------------ #
+
+    async def backup(self, dest_dir: Path) -> dict:
+        """Snapshot all report data into ``dest_dir``.
+
+        Uses SQLite's online backup API so the copy is consistent even while
+        the daemon keeps writing, then copies the JSONL mirror alongside it.
+        """
+        import shutil
+        import sqlite3
+
+        dest_dir = Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        db_dest = dest_dir / self.db_path.name
+        target = sqlite3.connect(str(db_dest))
+        try:
+            await self._db.backup(target)
+        finally:
+            target.close()
+
+        result: dict = {"dir": str(dest_dir), "db": str(db_dest),
+                        "events": await self.count()}
+        if self.jsonl_path and self.jsonl_path.exists():
+            jsonl_dest = dest_dir / self.jsonl_path.name
+            shutil.copy2(self.jsonl_path, jsonl_dest)
+            result["jsonl"] = str(jsonl_dest)
+        return result
+
+    # ------------------------------------------------------------------ #
     # Read                                                                 #
     # ------------------------------------------------------------------ #
 

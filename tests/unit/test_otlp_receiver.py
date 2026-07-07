@@ -10,6 +10,7 @@ from cia.otlp_receiver import (
     OTLPReceiver,
     parse_logs_payload,
     parse_metrics_payload,
+    parse_traces_payload,
 )
 from cia.schema import Phase
 
@@ -104,6 +105,64 @@ def test_parse_logs_maps_event_name_and_attributes():
 def test_empty_payloads_yield_no_events():
     assert parse_metrics_payload({}) == []
     assert parse_logs_payload({}) == []
+    assert parse_traces_payload({}) == []
+
+
+def test_parse_metrics_records_aggregation_temporality():
+    payload = metrics_payload()
+    metric = payload["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]
+    metric["sum"]["aggregationTemporality"] = 1          # numeric delta
+    events = parse_metrics_payload(payload)
+    assert events[0].meta["temporality"] == "delta"
+    # second metric had no temporality → key absent
+    assert "temporality" not in events[1].meta
+
+    metric["sum"]["aggregationTemporality"] = \
+        "AGGREGATION_TEMPORALITY_CUMULATIVE"             # string form
+    events = parse_metrics_payload(payload)
+    assert events[0].meta["temporality"] == "cumulative"
+
+
+def traces_payload() -> dict:
+    return {
+        "resourceSpans": [{
+            "scopeSpans": [{
+                "spans": [{
+                    "name": "query",
+                    "traceId": "aaaa",
+                    "spanId": "bbbb",
+                    "parentSpanId": "cccc",
+                    "startTimeUnixNano": str(NANO),
+                    "endTimeUnixNano": str(NANO + 1_500_000_000),
+                    "status": {"code": 2, "message": "boom"},
+                    "attributes": [
+                        {"key": "session.id",
+                         "value": {"stringValue": "sess-42"}},
+                    ],
+                }],
+            }],
+        }],
+    }
+
+
+def test_parse_traces_maps_spans_with_duration_and_error():
+    events = parse_traces_payload(traces_payload())
+    assert len(events) == 1
+    e = events[0]
+    assert e.phase == Phase.OTEL_SPAN
+    assert e.session_id == "sess-42"
+    assert e.ts == NANO / 1e9
+    assert e.duration_ms == pytest.approx(1500.0)
+    assert e.meta["name"] == "query"
+    assert e.meta["parent_span_id"] == "cccc"
+    assert e.error == "boom"                    # STATUS_CODE_ERROR
+
+
+def test_parse_traces_ok_span_has_no_error():
+    payload = traces_payload()
+    payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["status"] = {}
+    events = parse_traces_payload(payload)
+    assert events[0].error is None
 
 
 @pytest.mark.asyncio

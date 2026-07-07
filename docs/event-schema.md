@@ -27,7 +27,7 @@ Every CIA event is a JSON object. The canonical transport is JSONL (newline-deli
 
 | Phase | Emitted when | Key fields set |
 |---|---|---|
-| `api_request_start` | mitmproxy sees the POST to api.anthropic.com (via `message_start` SSE, or the HTTP roundtrip for non-streaming calls) | `model`, `tokens_input` |
+| `api_request_start` | mitmproxy sees the POST to api.anthropic.com (via `message_start` SSE, or the HTTP roundtrip for non-streaming calls) | `model`, `tokens_input`, `meta.request_id` (Anthropic `request-id` response header, when present) |
 | `api_thinking_start` | First thinking SSE block opens | `model` |
 | `api_thinking_end` | Thinking SSE block closes (or is cut off at stream end) | `model`, `duration_ms`, `thinking_tokens` |
 | `api_generation_start` | A text or tool_use SSE block opens | `model` |
@@ -145,8 +145,18 @@ When launched via `cia run`, Claude Code exports its own OpenTelemetry stream to
 
 | Phase | Emitted when | Key fields set |
 |---|---|---|
-| `otel_metric` | Claude Code exports a metric data point (e.g. `claude_code.token.usage`, `claude_code.cost.usage`, `claude_code.lines_of_code.count`, `claude_code.commit.count`) | `session_id`, `meta.name`, `meta.value`, `meta.unit`, `meta.attributes` |
-| `otel_event` | Claude Code exports a log event (e.g. `api_request`, `api_error`, `tool_result`, `user_prompt`) | `session_id`, `meta.name`, `meta.attributes`, `meta.severity` |
+| `otel_metric` | Claude Code exports a metric data point (e.g. `claude_code.token.usage`, `claude_code.cost.usage`, `claude_code.lines_of_code.count`, `claude_code.commit.count`, `claude_code.active_time.total`) | `session_id`, `meta.name`, `meta.value`, `meta.unit`, `meta.attributes`, `meta.temporality` (`delta`/`cumulative`, when the export declares it) |
+| `otel_event` | Claude Code exports a log event (e.g. `api_request`, `api_error`, `api_retries_exhausted`, `api_refusal`, `tool_result`, `tool_decision`, `hook_execution_complete`, `mcp_server_connection`, `compaction`, `permission_mode_changed`, `user_prompt`) | `session_id`, `meta.name`, `meta.attributes`, `meta.severity` |
+| `otel_span` | Claude Code exports a tracing span — **only under `cia run --trace`** (enhanced-telemetry beta) | `session_id`, `duration_ms`, `error` (when span status is error), `meta.name`, `meta.trace_id`, `meta.span_id`, `meta.parent_span_id`, `meta.attributes` |
+
+The `api_request` / `api_error` telemetry events carry the Anthropic
+`request_id` and `session.id` together; the proxy records the same
+request-id from the response header (`meta.request_id` on
+`api_request_start` / `api_response_end` / `api_request_error`). CIA's
+analytics join the two to attribute proxy events to sessions exactly.
+`cia run --detail` additionally unredacts tool parameters, full error
+messages, MCP server names and refusal categories in these events
+(`OTEL_LOG_TOOL_DETAILS=1`).
 
 ### Session tracking
 

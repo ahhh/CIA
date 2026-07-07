@@ -8,6 +8,7 @@ Commands:
   {"cmd": "status"}
   {"cmd": "stop"}
   {"cmd": "clear"}
+  {"cmd": "backup", "dir": "/path/to/dest"}
   {"cmd": "sessions"}
   {"cmd": "export", "format": "jsonl"|"csv", "session_id": "...", "since": 0.0, "until": 0.0}
 """
@@ -82,6 +83,13 @@ class SocketServer:
         if action == "clear":
             await self._daemon.store.clear()
             return {"ok": True, "cleared": True}
+
+        if action == "backup":
+            dest = cmd.get("dir")
+            if not dest:
+                return {"ok": False, "error": "backup requires a 'dir'"}
+            info = await self._daemon.store.backup(Path(dest))
+            return {"ok": True, **info}
 
         if action == "sessions":
             return {"ok": True, "sessions": await self._daemon.store.sessions()}

@@ -168,3 +168,35 @@ def test_unparseable_request_body_still_times_count_tokens():
     assert [e.phase for e in events] == [Phase.TOKENIZER_START, Phase.TOKENIZER_END]
     assert events[0].model is None
     assert events[1].tokens_input == 3
+
+
+def test_request_id_header_captured_on_non_streaming_messages():
+    flow = _make_flow(
+        "/v1/messages",
+        req_body={"model": "m", "stream": False},
+        resp_body={"model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    )
+    flow.response.headers["request-id"] = "req_xyz"
+    events = _run(flow)
+    start, end = events
+    assert start.meta["request_id"] == "req_xyz"
+    assert end.meta["request_id"] == "req_xyz"
+
+
+def test_request_id_header_captured_on_api_error():
+    flow = _make_flow("/v1/messages", req_body={"model": "m"},
+                      resp_body={"error": {"message": "overloaded"}}, status=529)
+    flow.response.headers["request-id"] = "req_err"
+    events = _run(flow)
+    assert [e.phase for e in events] == [Phase.API_REQUEST_ERROR]
+    assert events[0].meta["request_id"] == "req_err"
+
+
+def test_missing_request_id_header_is_not_invented():
+    flow = _make_flow(
+        "/v1/messages",
+        req_body={"model": "m", "stream": False},
+        resp_body={"model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    )
+    events = _run(flow)
+    assert all("request_id" not in e.meta for e in events)

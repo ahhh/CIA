@@ -137,6 +137,26 @@ class TestDaemonLifecycle:
         status = await _send_cmd(socket_path, {"cmd": "status"})
         assert status["events"] == 0
 
+    async def test_backup(self, running_daemon, tmp_path):
+        daemon, socket_path = running_daemon
+        await daemon.store.add(Event(phase=Phase.SESSION_START, session_id="x"))
+        dest = tmp_path / "snap"
+        result = await _send_cmd(socket_path, {"cmd": "backup", "dir": str(dest)})
+        assert result["ok"] is True
+        assert result["events"] == 1
+        assert Path(result["db"]).exists()
+        # Backed-up DB is a real SQLite copy with the event in it.
+        from cia.store import Store
+        restored = Store(Path(result["db"]))
+        await restored.open()
+        assert await restored.count() == 1
+        await restored.close()
+
+    async def test_backup_requires_dir(self, running_daemon):
+        _, socket_path = running_daemon
+        result = await _send_cmd(socket_path, {"cmd": "backup"})
+        assert result["ok"] is False
+
     async def test_sessions_command(self, running_daemon):
         daemon, socket_path = running_daemon
         await daemon.store.add(Event(phase=Phase.SESSION_START, session_id="x"))

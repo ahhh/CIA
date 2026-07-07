@@ -88,6 +88,7 @@ class SSEParser:
 
         self._model: Optional[str] = None
         self._request_anatomy: dict = {}
+        self._request_id: Optional[str] = None
         self._tokens_input: int = 0
         self._tokens_output: int = 0
         self._cache_read: int = 0
@@ -109,6 +110,13 @@ class SSEParser:
     def set_request_info(self, anatomy: dict) -> None:
         """Attach request-body anatomy; included in api_request_start meta."""
         self._request_anatomy = anatomy
+
+    def set_request_id(self, request_id: Optional[str]) -> None:
+        """Attach the Anthropic `request-id` response header.  Claude Code's
+        native telemetry stamps the same ID (plus session.id) on its
+        api_request events, so this is the exact join key that gives proxy
+        events a session attribution."""
+        self._request_id = request_id or None
 
     # ------------------------------------------------------------------ #
     # Ingestion                                                            #
@@ -196,6 +204,8 @@ class SSEParser:
             "cache_read_input_tokens": self._cache_read,
             "cache_creation_input_tokens": self._cache_creation,
         }
+        if self._request_id:
+            meta["request_id"] = self._request_id
         if self._request_anatomy:
             meta["request"] = self._request_anatomy
         self._emit(Event(
@@ -502,5 +512,6 @@ class SSEParser:
                 "usage": usage,
                 "thinking": thinking,
                 "content_blocks": self._blocks,
+                **({"request_id": self._request_id} if self._request_id else {}),
             },
         ))

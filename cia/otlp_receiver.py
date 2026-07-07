@@ -9,13 +9,14 @@ Claude Code exports OpenTelemetry metrics and log events when launched with:
   OTEL_EXPORTER_OTLP_PROTOCOL=http/json
   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 
-(`cia run` sets all of these.)  This receiver accepts POST /v1/metrics and
-POST /v1/logs in the OTLP JSON encoding and maps every data point / log
-record to a CIA Event:
+(`cia run` sets all of these.)  This receiver accepts POST /v1/metrics,
+POST /v1/logs and POST /v1/traces in the OTLP JSON encoding and maps every
+data point / log record / span to a CIA Event:
 
   otel_metric — e.g. claude_code.token.usage, claude_code.cost.usage,
                 claude_code.lines_of_code.count, claude_code.commit.count
   otel_event  — e.g. api_request, api_error, tool_result, user_prompt
+  otel_span   — beta span tracing, only under cia run --trace
 
 Claude Code stamps its telemetry with a session.id attribute, which is
 mapped onto Event.session_id — so this stream is fully session-attributed.
@@ -86,6 +87,14 @@ def _ts_from_nano(nano, fallback_required: bool = True) -> Optional[float]:
         return None
 
 
+# OTLP AggregationTemporality: numeric enum or spelled-out string form.
+_TEMPORALITY = {
+    1: "delta", 2: "cumulative",
+    "AGGREGATION_TEMPORALITY_DELTA": "delta",
+    "AGGREGATION_TEMPORALITY_CUMULATIVE": "cumulative",
+}
+
+
 def parse_metrics_payload(payload: dict) -> list[Event]:
     """Map an OTLP ExportMetricsServiceRequest (JSON) to otel_metric events."""
     events = []
@@ -96,6 +105,8 @@ def parse_metrics_payload(payload: dict) -> list[Event]:
                 unit = metric.get("unit")
                 body = metric.get("sum") or metric.get("gauge") \
                     or metric.get("histogram") or {}
+                temporality = _TEMPORALITY.get(
+                    body.get("aggregationTemporality"))
                 for dp in body.get("dataPoints", []):
                     attrs = _attrs_to_dict(dp.get("attributes", []))
                     if "sum" in dp or "count" in dp:      # histogram point
@@ -105,11 +116,14 @@ def parse_metrics_payload(payload: dict) -> list[Event]:
                     else:
                         value = _attr_value({"intValue": dp.get("asInt")}) \
                             if dp.get("asInt") is not None else None
+                    meta = {"name": name, "value": value, "unit": unit,
+                            "attributes": attrs}
+                    if temporality:
+                        meta["temporality"] = temporality
                     event = Event(
                         phase=Phase.OTEL_METRIC,
                         session_id=_session_id(attrs),
-                        meta={"name": name, "value": value, "unit": unit,
-                              "attributes": attrs},
+                        meta=meta,
                     )
                     ts = _ts_from_nano(dp.get("timeUnixNano"))
                     if ts:
@@ -140,6 +154,42 @@ def parse_logs_payload(payload: dict) -> list[Event]:
                 ts = _ts_from_nano(rec.get("timeUnixNano"))
                 if ts:
                     event.ts = ts
+                events.append(event)
+    return events
+
+
+def parse_traces_payload(payload: dict) -> list[Event]:
+    """Map an OTLP ExportTraceServiceRequest (JSON) to otel_span events.
+
+    Claude Code emits spans only under the enhanced-telemetry beta
+    (cia run --trace).  Each span becomes one event timestamped at span
+    start, with duration_ms derived from the span window.
+    """
+    events = []
+    for rs in payload.get("resourceSpans", []):
+        for ss in rs.get("scopeSpans", []):
+            for span in ss.get("spans", []):
+                attrs = _attrs_to_dict(span.get("attributes", []))
+                start = _ts_from_nano(span.get("startTimeUnixNano"))
+                end = _ts_from_nano(span.get("endTimeUnixNano"))
+                status = span.get("status") or {}
+                event = Event(
+                    phase=Phase.OTEL_SPAN,
+                    session_id=_session_id(attrs),
+                    duration_ms=(end - start) * 1000
+                                if start and end else None,
+                    error=status.get("message")
+                          if status.get("code") == 2 else None,   # STATUS_CODE_ERROR
+                    meta={
+                        "name": span.get("name", "?"),
+                        "trace_id": span.get("traceId"),
+                        "span_id": span.get("spanId"),
+                        "parent_span_id": span.get("parentSpanId") or None,
+                        "attributes": attrs,
+                    },
+                )
+                if start:
+                    event.ts = start
                 events.append(event)
     return events
 
@@ -190,7 +240,7 @@ class OTLPReceiver:
             elif path == "/v1/logs":
                 events = parse_logs_payload(payload)
             elif path == "/v1/traces":
-                events = []          # accepted but not mapped (yet)
+                events = parse_traces_payload(payload)
             else:
                 writer.write(_BAD)
                 return
