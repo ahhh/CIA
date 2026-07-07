@@ -1,6 +1,6 @@
 # CIA — Claude Instrumentation & Analysis
 
-External, passive monitor for Claude Code sessions. Observes API call latency, thinking phases, tool call timing, and file I/O without modifying Claude.
+External, passive monitor for Claude Code sessions. Observes API call latency, thinking phases, tool call timing, every network check-in, Claude Code's native telemetry (cost, errors, permissions, hooks, MCP), its on-disk transcripts, and file I/O — without modifying Claude.
 
 ## Quick start
 
@@ -171,7 +171,8 @@ Session attribution: proxy events carry no session ID of their own, but when nat
 
 ```
 cia start [--proxy-port 8080] [--hook-port 7171] [--otlp-port 4318]
-          [--db PATH] [--jsonl PATH] [--watch-dir DIR] [--foreground]
+          [--db PATH] [--jsonl PATH] [--watch-dir DIR]
+          [--watch-claude/--no-watch-claude] [--foreground]
 cia run [--proxy-port 8080] [--otlp-port 4318] [--detail] [--trace]
         [COMMAND...]                                          # default: claude
         # --detail: unredact tool params / errors / MCP names in native
@@ -179,7 +180,8 @@ cia run [--proxy-port 8080] [--otlp-port 4318] [--detail] [--trace]
         # --trace : Claude Code's beta span tracing → otel_span events
 cia stop
 cia status
-cia export [--format jsonl|csv] [--session ID] [--since EPOCH] [-o FILE]
+cia export [--format jsonl|csv] [--session ID] [--since EPOCH] [--until EPOCH]
+           [-o FILE]
 cia report [--session ID] [--since EPOCH] [--input FILE.jsonl] [--json]
            [--backup [DIR]] [--reset] [--yes] [--no-transcripts]
 cia tail [--interval 1.0]
@@ -205,7 +207,7 @@ See [docs/socket-api.md](docs/socket-api.md) for the full command reference.
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 54 tests, no network required
+pytest          # 183 tests, no network required
 ```
 
 See [docs/development.md](docs/development.md).
