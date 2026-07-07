@@ -99,21 +99,33 @@ def main():
 @click.option("--db",         default=str(CIA_DIR / "cia.db"), show_default=True, help="SQLite path")
 @click.option("--jsonl",      default=str(CIA_DIR / "events.jsonl"), show_default=True, help="JSONL mirror path")
 @click.option("--watch-dir",  "watch_dirs", multiple=True, type=click.Path(), help="Dirs to watch (repeatable)")
+@click.option("--watch-project/--no-watch-project", default=True, show_default=True,
+              help="Watch the current directory for file edits (file_change category 'project')")
 @click.option("--watch-claude/--no-watch-claude", default=True, show_default=True,
               help="Also watch Claude Code's own memory/session/transcript data for this project")
 @click.option("--foreground", is_flag=True, help="Run in foreground (no fork)")
-def start(proxy_port, hook_port, otlp_port, db, jsonl, watch_dirs, watch_claude, foreground):
+def start(proxy_port, hook_port, otlp_port, db, jsonl, watch_dirs, watch_project,
+          watch_claude, foreground):
     """Start the CIA monitoring daemon."""
     if SOCKET_PATH.exists():
         console.print("[yellow]CIA daemon appears to already be running. "
                       "Use 'cia stop' first.[/yellow]")
         sys.exit(1)
 
-    resolved_watch = [Path(d) for d in watch_dirs]
+    # Explicit --watch-dir dirs are treated as source trees too.
+    resolved_watch: list = [(Path(d), "project") for d in watch_dirs]
+    if watch_project:
+        cwd = Path.cwd()
+        if cwd == Path.home():
+            console.print("[yellow]  Project dir: not watching $HOME "
+                          "(start from a project directory, or pass --watch-dir)[/yellow]")
+        elif not any(d == cwd for d, _ in resolved_watch):
+            resolved_watch.append((cwd, "project"))
+            console.print(f"  Project dir: [cyan]watching {cwd}[/cyan]")
     if watch_claude:
         from cia.claude_paths import claude_watch_dirs
         claude_dirs = claude_watch_dirs(Path.cwd())
-        resolved_watch.extend(claude_dirs)
+        resolved_watch.extend((d, None) for d in claude_dirs)
         if claude_dirs:
             console.print(f"  Claude data: [cyan]watching {len(claude_dirs)} "
                           f"dir(s)[/cyan] [dim]({', '.join(d.name for d in claude_dirs)})[/dim]")
@@ -391,13 +403,24 @@ def export(fmt, session, since, until, output):
 @main.command()
 @click.option("--interval", default=1.0, show_default=True, help="Poll interval (seconds)")
 def tail(interval):
-    """Stream live events to the terminal (polls the daemon)."""
-    last_ts: float = time.time() - 1.0
+    """Stream live events to the terminal (polls the daemon).
+
+    Pages by store insert order (seq), not timestamp: sources like the OTLP
+    receiver and the proxy commit events late with earlier timestamps, and a
+    timestamp cursor would skip those forever.
+    """
+    last_ts: float = time.time() - 1.0   # first poll / legacy-daemon fallback
+    last_seq: int | None = None
     console.print("[cyan]Tailing CIA events (Ctrl-C to stop)...[/cyan]")
     try:
         while True:
             try:
-                result = _send({"cmd": "export", "format": "jsonl", "since": last_ts})
+                cmd = {"cmd": "export", "format": "jsonl"}
+                if last_seq is not None:
+                    cmd["since_seq"] = last_seq
+                else:
+                    cmd["since"] = last_ts
+                result = _send(cmd)
                 if result.get("ok"):
                     data = result.get("data", "").strip()
                     if data:
@@ -405,11 +428,18 @@ def tail(interval):
                             try:
                                 evt = json.loads(line)
                                 _print_event(evt)
+                                seq = evt.get("seq")
+                                if seq is not None:
+                                    last_seq = max(last_seq or 0, seq)
                                 ts = evt.get("ts", last_ts)
                                 if ts > last_ts:
                                     last_ts = ts + 0.0001
                             except Exception:
                                 pass
+                    if last_seq is None and result.get("max_seq") is not None:
+                        # Nothing (with a seq) matched the initial ts window;
+                        # seed the cursor from the store's current tip.
+                        last_seq = result["max_seq"]
             except Exception:
                 console.print("[yellow]Daemon not reachable, retrying...[/yellow]")
             time.sleep(interval)
@@ -458,7 +488,7 @@ def _event_extra(evt: dict) -> str:
         if meta.get("path"):
             parts.append(f"path={meta['path']}")
         elif meta.get("command"):
-            parts.append(f"$ {meta['command'][:60]}")
+            parts.append(f"$ {' '.join(meta['command'].split())[:60]}")
         elif meta.get("pattern"):
             parts.append(f"/{meta['pattern']}/")
         elif meta.get("target"):

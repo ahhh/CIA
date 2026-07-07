@@ -61,6 +61,13 @@ All events → asyncio.Queue → drain loop → Store.add()
                                                └─ JSONL append
 ```
 
+Watched dirs: the project directory `cia start` runs from (category
+`project`, `--no-watch-project` to disable), Claude's own data dirs
+(`--no-watch-claude`), and any `--watch-dir`. The drain loop also inspects
+hook `tool_call_end` events: when Claude writes a file outside every watched
+root, its directory gets a dynamic non-recursive watcher (category
+`artifact`, capped at 16).
+
 ## Key design decisions
 
 ### mitmproxy in a daemon thread

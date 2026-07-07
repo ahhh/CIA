@@ -122,3 +122,91 @@ def test_record_previews_are_capped(claude_dir):
 
     assert len(change["records"]) == 6           # 5 previews + the "more" marker
     assert change["records"][-1]["more"] == 4
+
+
+# ------------------------------------------------------------------ #
+# Project-tree watching: ignore rules, default category, lazy prime    #
+# ------------------------------------------------------------------ #
+
+from cia.watcher import FsWatcher, is_ignored_path
+
+
+def test_is_ignored_path():
+    assert is_ignored_path("/proj/.git/objects/ab/cdef")
+    assert is_ignored_path("/proj/node_modules/pkg/index.js")
+    assert is_ignored_path("/proj/.venv/lib/python3.13/site.py")
+    assert is_ignored_path("/proj/src/__pycache__/mod.cpython-313.pyc")
+    assert is_ignored_path("/proj/src/.DS_Store")
+    assert is_ignored_path("/Users/x/.cia/events.jsonl")   # CIA's own data: feedback loop
+    assert not is_ignored_path("/proj/src/main.py")
+    assert not is_ignored_path("/proj/README.md")
+
+
+def test_watcher_default_category(tmp_path):
+    w = FsWatcher(tmp_path, emit=lambda e: None, default_category="project")
+    assert w._categorize(str(tmp_path / "src" / "main.py")) == "project"
+    # Claude-data classification still wins over the default
+    assert w._categorize("/Users/x/.claude/projects/-p/s.jsonl") == "transcript"
+
+
+def test_project_files_get_diff_tracking(tmp_path):
+    """With a default category, ordinary source files are delta-tracked:
+    prime → edit → unified diff snippet."""
+    src = tmp_path / "main.py"
+    src.write_text("def f():\n    return 1\n")
+
+    delta = FileDelta(categorize=lambda p: "project")
+    delta.prime(tmp_path)
+
+    src.write_text("def f():\n    return 2\n")
+    change = delta.observe(str(src))
+    assert change["kind"] == "diff"
+    assert "+    return 2" in change["snippet"]
+
+
+def test_prime_skips_ignored_dirs(tmp_path):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "index").write_text("binary-ish")
+    (tmp_path / "main.py").write_text("x = 1\n")
+
+    delta = FileDelta(categorize=lambda p: "project")
+    delta.prime(tmp_path)
+    assert str(tmp_path / "main.py") in delta._sizes
+    assert str(tmp_path / ".git" / "index") not in delta._sizes
+
+
+def test_prime_nonrecursive(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "deep.py").write_text("x")
+    (tmp_path / "top.py").write_text("y")
+
+    delta = FileDelta(categorize=lambda p: "project")
+    delta.prime(tmp_path, recursive=False)
+    assert str(tmp_path / "top.py") in delta._sizes
+    assert str(tmp_path / "sub" / "deep.py") not in delta._sizes
+
+
+def test_lazy_snapshot_when_prime_budget_exhausted(tmp_path, monkeypatch):
+    """Big trees: prime records sizes only; the first change reports a
+    'modified' delta and snapshots, so the *second* change diffs."""
+    monkeypatch.setattr("cia.watcher._MAX_PRIME_TEXT", 0)
+    src = tmp_path / "main.py"
+    src.write_text("v1\n")
+
+    delta = FileDelta(categorize=lambda p: "project")
+    delta.prime(tmp_path)
+    assert str(src) in delta._sizes
+    assert str(src) not in delta._texts
+
+    src.write_text("v2 longer\n")
+    first = delta.observe(str(src))
+    assert first["kind"] == "modified"
+    assert "snippet" not in first
+
+    src.write_text("v3\n")
+    second = delta.observe(str(src))
+    assert second["kind"] == "diff"
+
+
+def test_atomic_write_staging_files_ignored():
+    assert is_ignored_path("/scratch/notes.txt.tmp.11032.3393c55091c7")

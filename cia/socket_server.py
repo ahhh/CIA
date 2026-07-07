@@ -10,7 +10,9 @@ Commands:
   {"cmd": "clear"}
   {"cmd": "backup", "dir": "/path/to/dest"}
   {"cmd": "sessions"}
-  {"cmd": "export", "format": "jsonl"|"csv", "session_id": "...", "since": 0.0, "until": 0.0}
+  {"cmd": "export", "format": "jsonl"|"csv", "session_id": "...", "since": 0.0, "until": 0.0,
+   "since_seq": 0}   — since_seq pages by store insert order; the response
+                       includes "max_seq" (highest insert seq) as a cursor seed
 """
 from __future__ import annotations
 
@@ -98,13 +100,17 @@ class SocketServer:
             fmt = cmd.get("format", "jsonl")
             kwargs = {
                 k: cmd[k]
-                for k in ("session_id", "since", "until")
+                for k in ("session_id", "since", "until", "since_seq")
                 if cmd.get(k) is not None
             }
+            # Cursor for seq-paging clients (cia tail). Read *before* the
+            # query: rows committed in between are then returned by the query
+            # or land above the cursor — either way nothing is skipped.
+            max_seq = await self._daemon.store.max_seq()
             if fmt == "csv":
                 data = await self._daemon.store.export_csv(**kwargs)
             else:
                 data = await self._daemon.store.export_jsonl(**kwargs)
-            return {"ok": True, "data": data}
+            return {"ok": True, "data": data, "max_seq": max_seq}
 
         return {"ok": False, "error": f"unknown command: {action!r}"}

@@ -56,6 +56,7 @@ async def running_daemon(tmp_path):
         jsonl_path=None,
         proxy_port=0,       # 0 = skip proxy thread
         hook_port=0,        # random port, not needed by these tests
+        otlp_port=0,        # 0 = skip OTLP receiver (4318 may be a live daemon)
         socket_path=socket_path,
         watch_dirs=[],
     )
@@ -107,6 +108,25 @@ class TestDaemonLifecycle:
         evt = json.loads(lines[0])
         assert evt["phase"] == "tool_call_start"
         assert evt["tool"] == "Bash"
+
+    async def test_export_since_seq_and_max_seq(self, running_daemon):
+        """The tail's cursor protocol: page by insert order so an event
+        committed late with an *earlier* timestamp is still delivered."""
+        daemon, socket_path = running_daemon
+        await daemon.store.add(Event(phase=Phase.NETWORK_REQUEST, ts=2000.0))
+
+        result = await _send_cmd(socket_path, {"cmd": "export", "format": "jsonl"})
+        assert result["max_seq"] == 1
+        assert json.loads(result["data"].strip())["seq"] == 1
+
+        # Late commit, older timestamp — a ts cursor at 2000.0 would skip it.
+        await daemon.store.add(Event(phase=Phase.OTEL_EVENT, ts=1000.0))
+        result = await _send_cmd(
+            socket_path, {"cmd": "export", "format": "jsonl", "since_seq": 1})
+        lines = result["data"].strip().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])["phase"] == "otel_event"
+        assert result["max_seq"] == 2
 
     async def test_export_csv(self, running_daemon):
         daemon, socket_path = running_daemon

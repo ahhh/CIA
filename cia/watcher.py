@@ -2,17 +2,19 @@
 Wraps fswatch (must be installed: brew install fswatch) to emit
 FILE_CHANGE events for a watched directory.
 
-For paths that are part of Claude's own data (transcripts, memory, todos —
-anything ``classify_path`` recognises) a ``FileDelta`` tracker keeps
-per-file state so each event can carry *what changed*: appended transcript
-records get parsed into compact previews, and small text files (memory,
-settings) get a capped unified diff against their previous content.
+For paths that get a category — Claude's own data (anything ``classify_path``
+recognises) or anything under a watcher started with a ``default_category``
+(project source trees, dirs Claude created files in) — a ``FileDelta``
+tracker keeps per-file state so each event can carry *what changed*:
+appended JSONL records get parsed into compact previews, and small text
+files get a capped unified diff against their previous content.
 """
 from __future__ import annotations
 
 import asyncio
 import difflib
 import json
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -26,41 +28,66 @@ _MAX_SNIPPET = 600           # chars per snippet / diff
 _MAX_DIFF_LINES = 12
 _MAX_RECORDS = 5             # parsed JSONL record previews per event
 _PREVIEW_CHARS = 150
+_MAX_PRIME_TEXT = 8 * 1024 * 1024   # total text snapshotted at prime time
+
+# Churn that is never a signal when watching a source tree. ``.cia`` is CIA's
+# own data dir — watching it would feed back (events.jsonl writes → events).
+_IGNORE_DIR_PARTS = {
+    ".git", ".hg", ".svn", ".venv", "venv", ".tox", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".cache", ".idea", "dist", "build", ".next", ".turbo", "target",
+    ".gradle", ".terraform", ".direnv", ".cia",
+}
+_IGNORE_FILE_SUFFIXES = (".pyc", ".pyo", ".swp", ".swx", ".tmp", ".lock~")
+_IGNORE_FILE_NAMES = {".DS_Store", "4913"}  # 4913: vim's write probe
+
+
+def is_ignored_path(path: str) -> bool:
+    """True for build/VCS/editor churn we never want file_change events for."""
+    p = Path(path)
+    if p.name in _IGNORE_FILE_NAMES or p.name.endswith(_IGNORE_FILE_SUFFIXES):
+        return True
+    if ".tmp." in p.name:   # atomic-write staging files (foo.txt.tmp.<pid>.<hash>)
+        return True
+    return any(part in _IGNORE_DIR_PARTS for part in p.parts)
 
 
 class FileDelta:
     """Tracks file sizes (and small-file contents) between change events so
     we can report what was appended / how the content changed."""
 
-    def __init__(self) -> None:
+    def __init__(self, categorize: Callable[[str], Optional[str]] = classify_path) -> None:
         self._sizes: dict[str, int] = {}
         self._texts: dict[str, str] = {}
+        self._categorize = categorize
 
     # ------------------------------------------------------------------ #
     # Priming                                                              #
     # ------------------------------------------------------------------ #
 
-    def prime(self, root: Path) -> None:
-        """Snapshot the Claude-data files already under ``root`` so the
-        first change after startup yields a real delta, not a blind
-        'snapshot'."""
-        try:
-            paths = [p for p in root.rglob("*") if p.is_file()]
-        except OSError:
-            return
-        for p in paths:
+    def prime(self, root: Path, recursive: bool = True) -> None:
+        """Snapshot the tracked files already under ``root`` so the first
+        change after startup yields a real delta, not a blind 'snapshot'.
+
+        Sizes are recorded for every tracked file; text contents only up to
+        a total budget (big source trees fall back to a lazy snapshot on
+        first change — see ``_observe_text``)."""
+        text_budget = _MAX_PRIME_TEXT
+        for p in _iter_files(root, recursive):
             sp = str(p)
-            if classify_path(sp) is None:
+            if is_ignored_path(sp) or self._categorize(sp) is None:
                 continue
             try:
                 size = p.stat().st_size
             except OSError:
                 continue
             self._sizes[sp] = size
-            if not sp.endswith(".jsonl") and size <= _MAX_SNAPSHOT:
+            if (text_budget > 0 and not sp.endswith(".jsonl")
+                    and size <= _MAX_SNAPSHOT):
                 text = _read_text(p)
                 if text is not None:
                     self._texts[sp] = text
+                    text_budget -= len(text)
 
     # ------------------------------------------------------------------ #
     # Observation                                                          #
@@ -129,11 +156,32 @@ class FileDelta:
         prev_text = self._texts.get(path)
         self._texts[path] = text
         if prev_text is None:
+            if prev_size is not None:
+                # Size was primed but the text snapshot was skipped (prime
+                # budget): take the snapshot now so the *next* edit diffs.
+                if size == prev_size:
+                    return None
+                return {"kind": "modified", "bytes_delta": size - prev_size}
             return {"kind": "created", "snippet": text[:_MAX_SNIPPET]}
         if prev_text == text:
             return None
         return {"kind": "diff", "bytes_delta": size - (prev_size or 0),
                 "snippet": _unified_snippet(prev_text, text)}
+
+
+def _iter_files(root: Path, recursive: bool):
+    """Yield files under ``root``, pruning ignored directories during the
+    walk (rglob can't prune, and descending into .git/.venv is the cost)."""
+    try:
+        if not recursive:
+            yield from (p for p in root.iterdir() if p.is_file())
+            return
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIR_PARTS]
+            for name in filenames:
+                yield Path(dirpath) / name
+    except OSError:
+        return
 
 
 def _read_text(p: Path) -> Optional[str]:
@@ -232,18 +280,28 @@ class FsWatcher:
         watch_dir: Path,
         emit: Callable[[Event], None],
         latency: float = 0.5,
+        recursive: bool = True,
+        default_category: Optional[str] = None,
     ) -> None:
         self._dir = watch_dir
         self._emit = emit
         self._latency = latency
+        self._recursive = recursive
+        self._default_category = default_category
         self._proc: asyncio.subprocess.Process | None = None
-        self._delta = FileDelta()
+        self._delta = FileDelta(categorize=self._categorize)
+
+    def _categorize(self, path: str) -> Optional[str]:
+        """Claude-data classification wins; otherwise the watcher's default
+        (e.g. 'project' for the source tree, 'artifact' for dirs Claude
+        created files in)."""
+        return classify_path(path) or self._default_category
 
     async def start(self) -> None:
-        self._delta.prime(self._dir)
+        self._delta.prime(self._dir, recursive=self._recursive)
         cmd = [
             "fswatch",
-            "--recursive",
+            *( ["--recursive"] if self._recursive else [] ),
             f"--latency={self._latency}",
             "--event=Created",
             "--event=Updated",
@@ -263,16 +321,17 @@ class FsWatcher:
                 if not line:
                     break
                 path = line.decode("utf-8", errors="replace").strip()
-                if path:
-                    meta = {"path": path, "watch_dir": str(self._dir)}
-                    category = classify_path(path)
-                    if category:
-                        meta["category"] = category
-                        meta["filename"] = Path(path).name
-                        change = self._delta.observe(path)
-                        if change:
-                            meta["change"] = change
-                    self._emit(Event(phase=Phase.FILE_CHANGE, meta=meta))
+                if not path or is_ignored_path(path):
+                    continue
+                meta = {"path": path, "watch_dir": str(self._dir)}
+                category = self._categorize(path)
+                if category:
+                    meta["category"] = category
+                    meta["filename"] = Path(path).name
+                    change = self._delta.observe(path)
+                    if change:
+                        meta["change"] = change
+                self._emit(Event(phase=Phase.FILE_CHANGE, meta=meta))
         except (FileNotFoundError, asyncio.CancelledError):
             pass
         finally:

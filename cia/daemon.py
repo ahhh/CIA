@@ -19,12 +19,17 @@ from typing import Optional
 from cia.hook_receiver import HookReceiver
 from cia.otlp_receiver import OTLPReceiver
 from cia.proxy import ProxyThread
-from cia.schema import Event
+from cia.schema import Event, Phase
 from cia.socket_server import SocketServer
 from cia.store import Store
-from cia.watcher import FsWatcher
+from cia.watcher import FsWatcher, is_ignored_path
 
 CIA_DIR = Path.home() / ".cia"
+
+# Dynamic watchers: when a hook reports Claude writing a file outside every
+# watched root (scratchpads, temp dirs), watch that file's directory too.
+_FILE_WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+_MAX_DYNAMIC_WATCHERS = 16
 
 
 class Daemon:
@@ -38,7 +43,7 @@ class Daemon:
         hook_port: int = 7171,
         otlp_port: int = 4318,
         socket_path: Path = CIA_DIR / "cia.sock",
-        watch_dirs: Optional[list[Path]] = None,
+        watch_dirs: Optional[list] = None,
     ) -> None:
         self.store = Store(db_path, jsonl_path)
         self._proxy_host = proxy_host
@@ -47,7 +52,12 @@ class Daemon:
         self._hook_port = hook_port
         self._otlp_port = otlp_port
         self._socket_path = socket_path
-        self._watch_dirs: list[Path] = watch_dirs or []
+        # Each entry is a Path or a (Path, default_category) tuple.
+        self._watch_specs: list[tuple[Path, Optional[str]]] = [
+            d if isinstance(d, tuple) else (d, None) for d in (watch_dirs or [])
+        ]
+        self._watch_roots: set[Path] = set()
+        self._dynamic_watcher_count = 0
 
         self._event_queue: asyncio.Queue[Event] = asyncio.Queue()
         self._tasks: list[asyncio.Task] = []
@@ -96,8 +106,12 @@ class Daemon:
         if self._otlp_port > 0:
             otlp = OTLPReceiver(self._emit, self._hook_host, self._otlp_port)
             self._tasks.append(asyncio.create_task(otlp.start(), name="otlp"))
-        for d in self._watch_dirs:
-            watcher = FsWatcher(d, self._emit)
+        for d, category in self._watch_specs:
+            try:
+                self._watch_roots.add(d.resolve())
+            except OSError:
+                self._watch_roots.add(d)
+            watcher = FsWatcher(d, self._emit, default_category=category)
             self._tasks.append(
                 asyncio.create_task(watcher.start(), name=f"watch:{d}")
             )
@@ -133,8 +147,41 @@ class Daemon:
                 event = await asyncio.wait_for(self._event_queue.get(), timeout=1.0)
                 await self.store.add(event)
                 self._event_queue.task_done()
+                self._maybe_watch_created_path(event)
             except asyncio.TimeoutError:
                 pass
+
+    def _maybe_watch_created_path(self, event: Event) -> None:
+        """When a hook reports Claude writing a file outside every watched
+        root, start watching that file's directory (non-recursively) so
+        follow-up changes there become file_change events too."""
+        if event.phase is not Phase.TOOL_CALL_END:
+            return
+        if event.tool not in _FILE_WRITE_TOOLS:
+            return
+        path = (event.meta or {}).get("path")
+        if not path:
+            return
+        try:
+            parent = Path(path).resolve().parent
+        except OSError:
+            return
+        if not parent.is_dir():
+            return
+        if is_ignored_path(str(parent)) or parent == Path.home():
+            return
+        if any(parent == root or root in parent.parents
+               for root in self._watch_roots):
+            return
+        if self._dynamic_watcher_count >= _MAX_DYNAMIC_WATCHERS:
+            return
+        self._dynamic_watcher_count += 1
+        self._watch_roots.add(parent)
+        watcher = FsWatcher(parent, self._emit, recursive=False,
+                            default_category="artifact")
+        self._tasks.append(
+            asyncio.create_task(watcher.start(), name=f"watch:{parent}")
+        )
 
     # ------------------------------------------------------------------ #
     # Cleanup                                                              #

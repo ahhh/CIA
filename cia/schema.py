@@ -69,6 +69,11 @@ class Event:
     thinking_tokens: Optional[int]    = None
     error: Optional[str]              = None
     meta: dict[str, Any]              = field(default_factory=dict)
+    # Store insert order (SQLite rowid). Set on events read back from the
+    # store; None on freshly created events. Lets consumers page in commit
+    # order — ts order lies when sources (OTLP batches, proxy flows)
+    # deliver events late with earlier timestamps.
+    seq: Optional[int]                = None
 
     # ------------------------------------------------------------------ #
     # Serialisation                                                        #
@@ -77,6 +82,8 @@ class Event:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["phase"] = self.phase.value
+        if d.get("seq") is None:
+            del d["seq"]
         return d
 
     def to_json(self) -> str:

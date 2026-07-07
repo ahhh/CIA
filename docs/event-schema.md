@@ -20,6 +20,7 @@ Every CIA event is a JSON object. The canonical transport is JSONL (newline-deli
 | `thinking_tokens` | int\|null | no | Estimated thinking tokens (~chars/4), set on `api_thinking_end` (per block) and `api_response_end` (whole turn) |
 | `error` | string\|null | no | Error message if applicable |
 | `meta` | object | yes | Extensible bag of additional data |
+| `seq` | int | no | Store insert order (SQLite rowid). Present on events exported from the store; absent on freshly emitted events. Cursor for live tailing — commit order, unlike `ts`, never goes backwards |
 
 ## Phase Taxonomy
 
@@ -125,10 +126,18 @@ Note: `tool_call_end` events may also set `error` when the tool returned a non-f
 
 | Phase | Emitted when | Key fields set |
 |---|---|---|
-| `file_change` | `fswatch` reports a create/update/delete/rename | `meta.path`, `meta.watch_dir`; for Claude-data paths also `meta.category`, `meta.filename`, `meta.change` |
+| `file_change` | `fswatch` reports a create/update/delete/rename | `meta.path`, `meta.watch_dir`; for categorised paths also `meta.category`, `meta.filename`, `meta.change` |
 
-For paths classified as Claude's own data (transcripts, memory, todos,
-settings), `meta.change` describes *what* changed:
+`meta.category` is one of the Claude-data classes (`transcript`, `memory`,
+`todo`, `settings`, `session`), `project` (the watched source tree — the
+daemon watches its start directory by default, `--no-watch-project` to
+disable), or `artifact` (a directory outside every watch root that Claude
+created/edited a file in via Write/Edit — the daemon starts watching such
+directories automatically, non-recursively, as hook events reveal them).
+VCS/build/editor churn (`.git`, `node_modules`, `.venv`, `__pycache__`,
+`.DS_Store`, …) is filtered out entirely.
+
+For every categorised path, `meta.change` describes *what* changed:
 
 | `change.kind` | Meaning | Extra fields |
 |---|---|---|
@@ -136,7 +145,7 @@ settings), `meta.change` describes *what* changed:
 | `created` | File first seen after watcher start | `records` (jsonl) or `snippet` (first 600 chars) |
 | `diff` | Small text file content changed | `bytes_delta`, `snippet` (unified diff, ≤ 12 lines / 600 chars) |
 | `rewrite` | A `.jsonl` file shrank (rewritten in place) | `bytes_delta`, `records` from the new tail |
-| `modified` | File too large (> 256 KB) to diff | `bytes_delta` |
+| `modified` | File too large (> 256 KB) to diff, or first change to a file whose text wasn't snapshotted at prime time (big source trees snapshot lazily; the next change diffs) | `bytes_delta` |
 | `removed` | A previously-seen file was deleted | — |
 
 ### Claude Code native telemetry (OTLP receiver)

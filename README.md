@@ -51,13 +51,13 @@ CIA turns an otherwise opaque Claude Code session into something you can step th
                                      cache_r=46000 stop=tool_use ttft=512ms
 14:22:05.020  tool_call_start                  tool=Edit  path=/src/auth.py
 14:22:05.430  tool_call_end          [412ms]   tool=Edit  path=/src/auth.py 1024b
-14:22:05.450  file_change                      [memory] …/auth.py (modified) +84b
+14:22:05.450  file_change                      [project] /src/auth.py (diff) +84b
 14:22:06.120  network_request                  GET statsig.anthropic.com/... 200 [telemetry] — feature flag check
 ```
 
 **Why each request happened — not just that it happened.** Every non-inference call Claude Code makes (boot connectivity probe, managed-settings fetch, Statsig flags, Sentry crash reports, update checks) is tagged with a category *and a plain-English reason*, so a stall during a turn is traceable to the exact background request that caused it.
 
-**See what Claude wrote to its own files.** File changes in `~/.claude` are captured as content deltas: appended transcript records parsed into previews, memory/settings edits rendered as capped unified diffs. You can watch Claude edit its own memory in real time.
+**See what Claude wrote — everywhere.** File changes are captured as content deltas in three scopes: the project source tree (the directory `cia start` runs from, category `project`), Claude's own data in `~/.claude` (`transcript` / `memory` / `settings` / `todo`), and directories Claude creates files in outside both — scratchpads, temp dirs — which the daemon starts watching automatically as hook events reveal them (category `artifact`). Appended transcript records are parsed into previews; everything else gets capped unified diffs. You can watch Claude edit its own memory in real time.
 
 **Cache and thinking forensics.** Each cache rebuild is attributed to a cause — a compaction, a 5-minute TTL expiry (with the idle gap that triggered it), or a prompt change — and priced in retokenized input. Each thinking block records whether it finished cleanly or was cut off by `max_tokens`, and how decisively Claude moved from thinking to its next tool call.
 
@@ -84,7 +84,8 @@ CIA turns an otherwise opaque Claude Code session into something you can step th
 | Claude Code native telemetry: cost, tokens, lines of code, commits, active time, plus every telemetry event — tool permission decisions, API errors/retries/refusals, hook executions, MCP connections, compactions, permission-mode changes (`otel_metric` / `otel_event`) | Built-in OTLP receiver on :4318 |
 | Claude Code's beta tracing spans — its own internal timing structure (`otel_span`) | OTLP receiver, `cia run --trace` |
 | On-disk session transcripts (exact per-message token usage & models, tool/skill/agent names, session titles, subagent sub-transcripts) and /insights usage-data (outcome, lines of code, commits) | Read at report time from `~/.claude/projects` / `~/.claude/usage-data` — retroactive, works even for sessions CIA never watched live (`--no-transcripts` to skip) |
-| File I/O in watched dirs | `fswatch` subprocess |
+| Project source-tree edits (category `project`), with content deltas: capped unified diffs of what actually changed in each file. VCS/build churn (`.git`, `node_modules`, `.venv`, …) is filtered out | `fswatch` on the directory `cia start` runs from (on by default; `--no-watch-project` to disable) + any `--watch-dir` |
+| Files Claude creates outside every watched dir (scratchpads, temp files — category `artifact`) | hook events reveal the Write/Edit target → the daemon starts watching that directory automatically (non-recursive, capped) |
 | Claude's own memory / session / transcript writes (categorised `file_change` events), with content deltas: appended transcript records parsed into previews, memory/settings edits as capped unified diffs (`meta.change`) | `fswatch` on `~/.claude/projects/<project>/` + `tasks` (on by default; `--no-watch-claude` to disable) |
 
 ## Output format
@@ -172,6 +173,7 @@ Session attribution: proxy events carry no session ID of their own, but when nat
 ```
 cia start [--proxy-port 8080] [--hook-port 7171] [--otlp-port 4318]
           [--db PATH] [--jsonl PATH] [--watch-dir DIR]
+          [--watch-project/--no-watch-project]
           [--watch-claude/--no-watch-claude] [--foreground]
 cia run [--proxy-port 8080] [--otlp-port 4318] [--detail] [--trace]
         [COMMAND...]                                          # default: claude
@@ -207,7 +209,7 @@ See [docs/socket-api.md](docs/socket-api.md) for the full command reference.
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 183 tests, no network required
+pytest          # 202 tests, no network required
 ```
 
 See [docs/development.md](docs/development.md).

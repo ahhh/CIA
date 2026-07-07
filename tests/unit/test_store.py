@@ -79,6 +79,44 @@ class TestAddAndQuery:
         assert sorted(sessions) == ["x", "y"]
 
 
+class TestSeqPaging:
+    """Paging by insert order (rowid) — what `cia tail` relies on so that
+    events committed late with earlier timestamps are never skipped."""
+
+    async def test_queried_events_carry_seq(self, store):
+        await _add_events(store, [Phase.SESSION_START, Phase.SESSION_END])
+        results = await store.query()
+        assert [e.seq for e in results] == [1, 2]
+
+    async def test_max_seq(self, store):
+        assert await store.max_seq() == 0
+        await _add_events(store, [Phase.SESSION_START, Phase.SESSION_END])
+        assert await store.max_seq() == 2
+
+    async def test_since_seq_pages_in_commit_order(self, store):
+        # Second event is committed later but timestamped *earlier* (an OTLP
+        # batch arriving late). A ts cursor past 2000.0 would skip it.
+        await store.add(Event(phase=Phase.NETWORK_REQUEST, ts=2000.0))
+        await store.add(Event(phase=Phase.OTEL_EVENT, ts=1000.0))
+
+        results = await store.query(since_seq=1)
+        assert len(results) == 1
+        assert results[0].phase is Phase.OTEL_EVENT
+        assert results[0].seq == 2
+
+        assert await store.query(since_seq=2) == []
+
+    async def test_export_jsonl_includes_seq(self, store):
+        import json
+        await _add_events(store, [Phase.SESSION_START])
+        line = (await store.export_jsonl()).strip()
+        assert json.loads(line)["seq"] == 1
+
+    async def test_fresh_event_json_has_no_seq(self):
+        e = Event(phase=Phase.SESSION_START)
+        assert "seq" not in e.to_dict()
+
+
 class TestClear:
     async def test_clear(self, store):
         await _add_events(store, [Phase.SESSION_START])

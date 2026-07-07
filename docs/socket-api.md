@@ -63,16 +63,26 @@ Response:
   "format": "jsonl",
   "session_id": "abc-123",
   "since": 1716000000.0,
-  "until": 1716100000.0
+  "until": 1716100000.0,
+  "since_seq": 4210
 }
 ```
 
 All filter fields are optional. `format` defaults to `"jsonl"`; also accepts `"csv"`.
 
+`since`/`until` filter by event timestamp (ordered by `ts`). `since_seq`
+instead pages by **store insert order** (SQLite rowid, exposed as `seq` on
+each exported event) and returns events in commit order — use it for live
+tailing, where a timestamp cursor would permanently skip events that are
+committed late with earlier timestamps (OTLP batches, proxy flow completions).
+
 Response:
 ```json
-{"ok": true, "data": "...JSONL or CSV string..."}
+{"ok": true, "data": "...JSONL or CSV string...", "max_seq": 4223}
 ```
+
+`max_seq` is the highest insert seq in the store at query time — seed a
+`since_seq` cursor with it when the first poll returns no events.
 
 ---
 
